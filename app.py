@@ -7,8 +7,11 @@ filter-scoped queries for per-well detail.
 """
 
 import json
+import os
+import time
 import urllib3
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -17,16 +20,34 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-# Silence the "InsecureRequestWarning" we emit because the server's cert chain
-# is not trusted by the bundled Anaconda Python on some macOS installs.
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# ---------------------------------------------------------------------------
+# TLS strategy
+# ---------------------------------------------------------------------------
+# Priority:
+#   1. `SECRETARIA_CA_BUNDLE` env var → path to a .pem bundle (preferred).
+#   2. `REQUESTS_CA_BUNDLE` env var → standard requests convention.
+#   3. `SECRETARIA_VERIFY_SSL=1` → use system defaults (requires valid certs).
+#   4. Otherwise → verify=False (fallback; Anaconda macOS bundle often lacks
+#      the gov CA chain). Warning suppressed, TLS still encrypts but no MITM
+#      protection. Acceptable for public read-only data.
+_CA_BUNDLE = os.getenv("SECRETARIA_CA_BUNDLE") or os.getenv("REQUESTS_CA_BUNDLE")
+if _CA_BUNDLE and os.path.exists(_CA_BUNDLE):
+    VERIFY_SSL: bool | str = _CA_BUNDLE
+    TLS_MODE = f"CA bundle: {os.path.basename(_CA_BUNDLE)}"
+elif os.getenv("SECRETARIA_VERIFY_SSL") in ("1", "true", "yes"):
+    VERIFY_SSL = True
+    TLS_MODE = "System CA store"
+else:
+    VERIFY_SSL = False
+    TLS_MODE = "Unverified (fallback)"
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---------------------------------------------------------------------------
 # Page config & CSS
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Argentina Well Intelligence Dashboard",
-    page_icon="🛢️",
+    page_icon=":material/oil_barrel:",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -34,31 +55,151 @@ st.set_page_config(
 st.markdown(
     """
 <style>
+    /* ───────────────────────────────────────────────
+       Palette (warm neutrals)
+       cream-50  #F5EFE6  main bg
+       cream-100 #EDE5D8  secondary bg / cards
+       taupe-200 #D8CDBC  borders / muted
+       taupe-400 #B9A999  muted text
+       brown-500 #9A8577  accent-light
+       brown-600 #7A5D4B  primary accent
+       brown-700 #5C3E29  headings
+       espresso  #2E1E12  primary text / dark surfaces
+       ─────────────────────────────────────────────── */
+
+    /* ── Sidebar (dark espresso with cream text) ── */
     [data-testid="stSidebar"] {
-        background-color: #1e1e1e;
+        background: linear-gradient(180deg, #2E1E12 0%, #3D2A1C 100%);
+        border-right: 1px solid #5C3E29;
     }
-    [data-testid="stSidebar"] * {
-        color: #eaeaea !important;
+    [data-testid="stSidebar"] *,
+    [data-testid="stSidebar"] label,
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] span,
+    [data-testid="stSidebar"] div {
+        color: #EDE5D8 !important;
     }
-    [data-testid="stSidebar"] .stSelectbox label,
-    [data-testid="stSidebar"] .stCheckbox label {
-        color: #eaeaea !important;
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3,
+    [data-testid="stSidebar"] h4 {
+        color: #F5EFE6 !important;
     }
+    [data-testid="stSidebar"] hr {
+        border-color: #5C3E29 !important;
+    }
+    /* Sidebar inputs: readable on dark */
+    [data-testid="stSidebar"] [data-baseweb="select"] > div,
+    [data-testid="stSidebar"] input,
+    [data-testid="stSidebar"] textarea {
+        background-color: #3D2A1C !important;
+        color: #F5EFE6 !important;
+        border-color: #5C3E29 !important;
+    }
+
+    /* ── Main area headings (warm dark brown) ── */
+    .stApp h1, .stApp h2, .stApp h3, .stApp h4 { color: #2E1E12; }
+
+    /* ── Cards (basin / callouts) ── */
     .basin-card {
-        background: #ffffff;
-        border-radius: 10px;
-        padding: 1rem 1.2rem;
-        margin-bottom: 0.6rem;
-        border-left: 4px solid #2563eb;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+        background: #FFFFFF;
+        border-radius: 14px;
+        padding: 1.1rem 1.3rem;
+        margin-bottom: .6rem;
+        border: 1px solid #EDE5D8;
+        border-left: 4px solid #7A5D4B;
+        box-shadow: 0 2px 6px rgba(46, 30, 18, 0.06);
+        transition: box-shadow .15s ease, transform .15s ease;
     }
-    .basin-card h4 { margin: 0 0 .3rem 0; color:#0f172a; }
-    .basin-card .meta { color:#475569; font-size:.9rem; }
-    .pill-green  { background:#16a34a; color:#fff; padding:2px 10px; border-radius:4px; font-size:.8rem; font-weight:600;}
-    .pill-orange { background:#ea580c; color:#fff; padding:2px 10px; border-radius:4px; font-size:.8rem; font-weight:600;}
-    .pill-red    { background:#dc2626; color:#fff; padding:2px 10px; border-radius:4px; font-size:.8rem; font-weight:600;}
-    .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
-    .muted { color:#64748b; font-size:.9rem; }
+    .basin-card:hover {
+        box-shadow: 0 4px 14px rgba(46, 30, 18, 0.10);
+        transform: translateY(-1px);
+    }
+    .basin-card h4 { margin: 0 0 .35rem 0; color: #2E1E12; }
+    .basin-card .meta { color: #7A5D4B; font-size: .9rem; }
+
+    /* ── Status pills ── */
+    .pill-green  { background:#4F7A4A; color:#F5EFE6; padding:2px 10px; border-radius:20px; font-size:.8rem; font-weight:600; }
+    .pill-orange { background:#B8663A; color:#F5EFE6; padding:2px 10px; border-radius:20px; font-size:.8rem; font-weight:600; }
+    .pill-red    { background:#8B3A2E; color:#F5EFE6; padding:2px 10px; border-radius:20px; font-size:.8rem; font-weight:600; }
+
+    /* ── Buttons ── */
+    .stButton > button {
+        border-radius: 10px !important;
+        border: 1px solid #D8CDBC !important;
+        background-color: #FFFFFF !important;
+        color: #2E1E12 !important;
+        transition: all .15s ease;
+    }
+    .stButton > button:hover {
+        background-color: #EDE5D8 !important;
+        border-color: #B9A999 !important;
+    }
+    .stButton > button[kind="primary"] {
+        background-color: #7A5D4B !important;
+        border-color: #7A5D4B !important;
+        color: #F5EFE6 !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background-color: #5C3E29 !important;
+        border-color: #5C3E29 !important;
+    }
+
+    /* Sidebar buttons (inverted) */
+    [data-testid="stSidebar"] .stButton > button {
+        background-color: #5C3E29 !important;
+        color: #F5EFE6 !important;
+        border-color: #7A5D4B !important;
+    }
+    [data-testid="stSidebar"] .stButton > button:hover {
+        background-color: #7A5D4B !important;
+    }
+
+    /* ── Progress bars ── */
+    [data-testid="stProgressBar"] > div > div {
+        background-color: #7A5D4B !important;
+    }
+
+    /* ── Metrics ── */
+    [data-testid="stMetricLabel"] { color: #7A5D4B !important; font-weight: 500; }
+    [data-testid="stMetricValue"] { color: #2E1E12 !important; }
+    [data-testid="stMetric"] {
+        background: #FFFFFF;
+        border-radius: 12px;
+        padding: .8rem 1rem;
+        border: 1px solid #EDE5D8;
+    }
+
+    /* ── Tabs ── */
+    .stTabs [data-baseweb="tab-list"] { gap: 6px; }
+    .stTabs [data-baseweb="tab"] {
+        background-color: transparent;
+        border-radius: 10px 10px 0 0;
+        color: #7A5D4B;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #EDE5D8 !important;
+        color: #2E1E12 !important;
+    }
+
+    /* ── DataFrames / tables ── */
+    [data-testid="stDataFrame"] {
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid #EDE5D8;
+    }
+
+    /* ── Expander ── */
+    .streamlit-expanderHeader, [data-testid="stExpander"] summary {
+        background-color: #FFFFFF !important;
+        border-radius: 10px !important;
+        border: 1px solid #EDE5D8 !important;
+    }
+
+    /* ── Layout ── */
+    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; max-width: 1400px; }
+    .muted { color: #B9A999; font-size: .9rem; }
+
     @media (max-width: 768px) { .block-container { padding: .5rem; } }
 </style>
     """,
@@ -84,12 +225,37 @@ RESOURCES_BY_YEAR = {
     2020: "c4a4a6a0-e75a-4e12-ae5c-54d53a70348c",
     2019: "8bc0d61c-0408-43d4-a7bc-7178fcb5d37e",
     2018: "333fd72a-9b83-4bc1-bc94-0f5940b52331",
+    # Años históricos importables via CSV local (no tienen resource_id de API porque
+    # el bulk-fetch no los descarga; load_year_from_csv los acepta igual).
+    2017: "local-csv-2017",
+    2016: "local-csv-2016",
+    2015: "local-csv-2015",
+    2014: "local-csv-2014",
+    2013: "local-csv-2013",
+    2012: "local-csv-2012",
+    2011: "local-csv-2011",
 }
 # "Capítulo IV — Pozos" (padrón de pozos — well metadata, drilling info, coords)
 PADRON_RESOURCE = "cb5c0f04-7835-45cd-b982-3e25ca7d7751"
 
+# "Año vivo" — el único que se actualiza mensualmente vía API. Los años
+# anteriores son históricos estáticos (no cambian) y se cargan por CSV.
+LIVE_YEAR = 2026
+
 HTTP_TIMEOUT = 90
-VERIFY_SSL = False  # Anaconda's bundled certs fail against this gov CA chain.
+# VERIFY_SSL is resolved above from env (SECRETARIA_CA_BUNDLE / REQUESTS_CA_BUNDLE
+# / SECRETARIA_VERIFY_SSL) with a safe fallback for local dev on Anaconda macOS.
+
+# Browser-like User-Agent — some corporate firewalls (Fortinet/WAFs) and CDNs
+# reject bare python-requests UAs even for public APIs.
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+}
 
 # Mock ownership — well-known joint ventures (public info). Used in detail screen.
 OWNERSHIP_MOCK = {
@@ -103,29 +269,376 @@ OWNERSHIP_MOCK = {
 
 
 # ---------------------------------------------------------------------------
+# Local disk cache for bulk-fetched year data
+# ---------------------------------------------------------------------------
+# The SQL endpoint (/api/3/action/datastore_search_sql) was disabled by the
+# publisher in April 2026. We now fetch the full yearly resource via the
+# REST datastore_search endpoint (paginated, rate-limited to 5 req/s), cache
+# it to disk as parquet, and do all aggregations locally in pandas.
+CACHE_DIR = Path.home() / ".macro_pm_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+MANIFEST_PATH = CACHE_DIR / "manifest.json"
+
+PAGE_SIZE = 32000          # CKAN datastore_search default hard cap
+RATE_LIMIT_SLEEP = 0.22    # ~4.5 req/s, under the 5 req/s policy
+
+
+def _year_cache_path(year: int) -> Path:
+    # pickle+gzip en lugar de parquet: evita dependencia de pyarrow (que tiene
+    # binary-compatibility issues en algunos Anaconda). Es ~3x más grande que
+    # parquet pero sigue siendo mucho más chico que el CSV original.
+    return CACHE_DIR / f"{year}.pkl.gz"
+
+
+def _read_manifest() -> dict:
+    if not MANIFEST_PATH.exists():
+        return {}
+    try:
+        return json.loads(MANIFEST_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _write_manifest(m: dict) -> None:
+    try:
+        MANIFEST_PATH.write_text(json.dumps(m, indent=2, default=str))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # API helpers
 # ---------------------------------------------------------------------------
-def sql_query(sql: str, timeout: int = HTTP_TIMEOUT) -> pd.DataFrame | None:
-    """Run a SQL query against the CKAN datastore and return a DataFrame.
+_RETRY_BACKOFF = (0.5, 1.5, 4.0)  # seconds before attempts 2, 3, 4
+_QUERY_LOG_CAP = 50  # keep last N entries in session state
 
-    Returns None on network/parse failure. Caller decides how to handle.
+
+def _log_query(sql: str, elapsed: float, rows: int, error: str | None) -> None:
+    """Append a query telemetry row to session state (capped)."""
+    log = st.session_state.setdefault("_query_log", [])
+    log.append({
+        "ts": datetime.now().strftime("%H:%M:%S"),
+        "ms": int(elapsed * 1000),
+        "rows": rows,
+        "error": (error[:120] if error else ""),
+        "sql_head": " ".join(sql.split())[:140],
+    })
+    if len(log) > _QUERY_LOG_CAP:
+        del log[: len(log) - _QUERY_LOG_CAP]
+
+
+def _fetch_page(resource_id: str, offset: int, limit: int, timeout: int = HTTP_TIMEOUT) -> dict | None:
+    """Fetch a single page from datastore_search with retries. Returns parsed JSON result dict."""
+    last_err: str | None = None
+    for attempt in range(len(_RETRY_BACKOFF) + 1):
+        try:
+            r = requests.get(
+                API_SEARCH,
+                params={"resource_id": resource_id, "offset": offset, "limit": limit},
+                timeout=timeout, verify=VERIFY_SSL, headers=HTTP_HEADERS,
+            )
+            if 500 <= r.status_code < 600:
+                last_err = f"HTTP {r.status_code}"
+                if attempt < len(_RETRY_BACKOFF):
+                    time.sleep(_RETRY_BACKOFF[attempt]); continue
+                break
+            if r.status_code == 403:
+                body = r.text.lower() if r.text else ""
+                if "fortinet" in body or "webfilter" in body or "blocked" in body:
+                    last_err = "HTTP 403 — bloqueado por firewall corporativo."
+                else:
+                    last_err = "HTTP 403 — rate-limit (5 req/s) o IP baneada 24hs. Esperá o cambiá de red."
+                break
+            r.raise_for_status()
+            data = r.json()
+            if not data.get("success"):
+                last_err = f"API: {str(data.get('error', ''))[:300]}"
+                break
+            return data["result"]
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_err = f"Network: {e}"
+            if attempt < len(_RETRY_BACKOFF):
+                time.sleep(_RETRY_BACKOFF[attempt]); continue
+            break
+        except requests.exceptions.RequestException as e:
+            last_err = f"HTTP: {e}"
+            break
+        except ValueError as e:
+            last_err = f"Parse: {e}"
+            break
+    st.session_state["_last_api_error"] = last_err
+    return None
+
+
+def fetch_resource_paginated(
+    resource_id: str,
+    progress_cb=None,
+) -> tuple[pd.DataFrame | None, int]:
+    """Fetch an entire resource by paginating datastore_search.
+
+    Respects the 5 req/s rate limit via RATE_LIMIT_SLEEP between pages.
+    Returns (DataFrame, expected_total). The DataFrame may be partial if a page
+    repeatedly failed even after extended retries — the caller must compare
+    len(df) vs expected_total to decide whether to persist.
     """
+    t0 = time.perf_counter()
+    first = _fetch_page(resource_id, offset=0, limit=PAGE_SIZE)
+    if first is None:
+        _log_query(f"bulk {resource_id}", time.perf_counter() - t0, 0,
+                   st.session_state.get("_last_api_error"))
+        return None, 0
+    total = int(first.get("total") or 0)
+    records = list(first.get("records") or [])
+    if progress_cb:
+        progress_cb(len(records), total)
+
+    # Outer retries: if a page fails after its inner retries (4 attempts),
+    # pause longer and try again instead of silently giving up.
+    OUTER_RETRY_SLEEPS = (15.0, 45.0, 90.0)  # 3 extra outer attempts
+
+    offset = len(records)
+    while offset < total:
+        time.sleep(RATE_LIMIT_SLEEP)
+        page = _fetch_page(resource_id, offset=offset, limit=PAGE_SIZE)
+        if page is None:
+            # Inner retries exhausted — try a few outer retries with long pauses
+            recovered = False
+            for outer_sleep in OUTER_RETRY_SLEEPS:
+                time.sleep(outer_sleep)
+                page = _fetch_page(resource_id, offset=offset, limit=PAGE_SIZE)
+                if page is not None:
+                    recovered = True
+                    break
+            if not recovered:
+                # Definitive failure — abort and let caller see partial
+                break
+        recs = page.get("records") or []
+        if not recs:
+            break
+        records.extend(recs)
+        offset += len(recs)
+        if progress_cb:
+            progress_cb(len(records), total)
+
+    df = pd.DataFrame(records)
+    _log_query(f"bulk {resource_id}", time.perf_counter() - t0, len(df), None)
+    return df, total
+
+
+# Columns we expect to coerce to numeric in the production resource
+_NUMERIC_COLS = [
+    "anio", "mes", "idpozo", "prod_pet", "prod_gas", "prod_agua",
+    "iny_agua", "iny_gas", "iny_co2", "iny_otro", "tef", "vida_util",
+    "profundidad", "coordenadax", "coordenaday", "idusuario",
+]
+
+
+def _postprocess_year_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce types, strip whitespace on text columns, derive helpers."""
+    for c in _NUMERIC_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    # Strip trailing/leading whitespace on likely-text columns
+    for c in ("empresa", "areayacimiento", "cuenca", "provincia",
+              "tipo_de_recurso", "formacion", "sigla", "tipopozo"):
+        if c in df.columns:
+            df[c] = df[c].astype("string").str.strip()
+    if "anio" in df.columns and "mes" in df.columns:
+        df["yyyymm"] = (df["anio"].fillna(0).astype(int) * 100
+                        + df["mes"].fillna(0).astype(int))
+    return df
+
+
+def load_year(year: int, force: bool = False, progress_cb=None) -> pd.DataFrame | None:
+    """Return the full DataFrame for a year, using disk cache when available.
+
+    If `force=True`, re-download even if the parquet exists on disk.
+    Si el resource_id es placeholder (local-csv-YYYY), nunca consulta la API —
+    ese año solo se carga vía CSV local.
+    """
+    rid = RESOURCES_BY_YEAR.get(year)
+    if rid is None:
+        return None
+
+    path = _year_cache_path(year)
+    if path.exists() and not force:
+        try:
+            return pd.read_pickle(path, compression="gzip")
+        except Exception:
+            pass  # corrupt cache — re-download
+
+    # Año sin resource_id real (histórico estático) — solo vía CSV local
+    if str(rid).startswith("local-csv-"):
+        st.session_state["_last_api_error"] = (
+            f"El año {year} no se descarga vía API (es histórico). "
+            f"Usá 'Cargar desde CSV local' para importarlo."
+        )
+        return None
+
+    df, expected_total = fetch_resource_paginated(rid, progress_cb=progress_cb)
+    if df is None or df.empty:
+        return df
+
+    df = _postprocess_year_df(df)
+
+    # Detectar fetch parcial: si la API reportó N filas y bajamos < 99% de N,
+    # NO persistir como caché bueno (causaría que la app crea estar al día con
+    # datos truncados, como pasó con 2026: 113k de 241k).
+    is_partial = expected_total > 0 and len(df) < int(expected_total * 0.99)
+    if is_partial:
+        st.session_state["_last_api_error"] = (
+            f"⚠️ Descarga incompleta: {len(df):,} de {expected_total:,} filas "
+            f"({len(df)*100//max(expected_total,1)}%). Se cayeron páginas. "
+            f"Volvé a apretar 'Actualizar datos {year}' para reintentar."
+        )
+        # NO escribir el pickle si ya existe uno bueno; si no existe, escribir
+        # pero marcar partial=True en el manifest para que la próxima corrida
+        # intente completar.
+        if not path.exists():
+            try:
+                df.to_pickle(path, compression="gzip")
+            except Exception as e:
+                st.session_state["_last_api_error"] = f"No pude escribir caché: {e}"
+                return df
+            mani = _read_manifest()
+            mani[str(year)] = {
+                "downloaded_at": datetime.now().isoformat(timespec="seconds"),
+                "rows": int(len(df)),
+                "expected_rows": int(expected_total),
+                "partial": True,
+                "last_yyyymm": int(df["yyyymm"].max()) if "yyyymm" in df.columns and len(df) else None,
+            }
+            _write_manifest(mani)
+        return df
+
+    # Persist to disk (full fetch)
     try:
-        r = requests.get(API_SQL, params={"sql": sql}, timeout=timeout, verify=VERIFY_SSL)
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("success"):
-            err = data.get("error", {})
-            st.session_state["_last_api_error"] = str(err)[:400]
+        df.to_pickle(path, compression="gzip")
+    except Exception as e:
+        st.session_state["_last_api_error"] = f"No pude escribir caché: {e}"
+        return df  # devolvemos igual para que la sesión actual funcione
+
+    # Update manifest
+    mani = _read_manifest()
+    mani[str(year)] = {
+        "downloaded_at": datetime.now().isoformat(timespec="seconds"),
+        "rows": int(len(df)),
+        "expected_rows": int(expected_total) if expected_total else int(len(df)),
+        "partial": False,
+        "last_yyyymm": int(df["yyyymm"].max()) if "yyyymm" in df.columns and len(df) else None,
+    }
+    _write_manifest(mani)
+
+    return df
+
+
+@st.cache_data(ttl=None, show_spinner=False)
+def _cached_year(year: int, cache_token: str) -> pd.DataFrame | None:
+    """In-memory cache of load_year(). `cache_token` is bumped by the Refresh
+    button to invalidate without touching disk (disk is handled by load_year)."""
+    return load_year(year, force=False)
+
+
+def year_df(year: int) -> pd.DataFrame | None:
+    """Primary accessor — use this in data functions."""
+    tok = st.session_state.get("_cache_token", "v1")
+    return _cached_year(year, tok)
+
+
+# ---------------------------------------------------------------------------
+# Fallback: cargar CSV local (cuando la API del gobierno está caída)
+# ---------------------------------------------------------------------------
+_CSV_SCAN_DIRS = [
+    Path("/Users/Manuel/Desktop/Macro PM"),
+    Path("/Users/Manuel/Desktop/Macro PM/CSVs"),
+    Path("/Users/Manuel/Desktop/Macro PM/csv_downloads"),
+    Path("/Users/Manuel/Desktop/Macro PM/csv_raw"),
+    Path.home() / "Downloads",
+]
+
+
+def scan_local_csvs() -> dict[int, Path]:
+    """Escanea carpetas conocidas buscando CSVs de producción; devuelve {año: path}."""
+    import re
+    found: dict[int, Path] = {}
+    for d in _CSV_SCAN_DIRS:
+        if not d.exists():
+            continue
+        for p in d.glob("*.csv"):
+            name = p.name.lower()
+            if "pozo" not in name and "petr" not in name and "gas" not in name:
+                continue
+            m = re.search(r"(20\d{2})", p.name)
+            if not m:
+                continue
+            y = int(m.group(1))
+            if y not in RESOURCES_BY_YEAR:
+                continue
+            # Preferir el archivo más grande (la versión completa) si hay duplicados
+            if y not in found or p.stat().st_size > found[y].stat().st_size:
+                found[y] = p
+    return dict(sorted(found.items(), reverse=True))
+
+
+def load_year_from_csv(year: int, csv_path: Path, progress_cb=None) -> pd.DataFrame | None:
+    """Lee un CSV local de producción, lo post-procesa y guarda como parquet."""
+    if not csv_path.exists():
+        st.session_state["_last_api_error"] = f"CSV no existe: {csv_path}"
+        return None
+    try:
+        if progress_cb:
+            progress_cb(0, None)
+        # encoding utf-8-sig para sacar BOM; low_memory=False para tipos consistentes
+        df = pd.read_csv(csv_path, encoding="utf-8-sig", low_memory=False)
+    except Exception as e:
+        st.session_state["_last_api_error"] = f"Error leyendo CSV: {e}"
+        return None
+
+    df = _postprocess_year_df(df)
+
+    # Filtrar al año pedido (por si el CSV trae varios)
+    if "anio" in df.columns:
+        df = df[df["anio"] == year].copy()
+        if df.empty:
+            st.session_state["_last_api_error"] = (
+                f"El CSV no contiene filas con anio={year}"
+            )
             return None
-        records = data["result"]["records"]
-        return pd.DataFrame(records)
-    except requests.exceptions.RequestException as e:
-        st.session_state["_last_api_error"] = f"Network: {e}"
-        return None
-    except ValueError as e:
-        st.session_state["_last_api_error"] = f"Parse: {e}"
-        return None
+
+    # Persist
+    path = _year_cache_path(year)
+    try:
+        df.to_pickle(path, compression="gzip")
+    except Exception as e:
+        st.session_state["_last_api_error"] = f"No pude escribir caché: {e}"
+        return df
+
+    mani = _read_manifest()
+    mani[str(year)] = {
+        "downloaded_at": datetime.now().isoformat(timespec="seconds"),
+        "rows": int(len(df)),
+        "last_yyyymm": int(df["yyyymm"].max()) if "yyyymm" in df.columns and len(df) else None,
+        "source": f"csv:{csv_path.name}",
+    }
+    _write_manifest(mani)
+
+    if progress_cb:
+        progress_cb(len(df), len(df))
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Legacy SQL shim — the SQL endpoint is dead (disabled by publisher in Apr 2026).
+# Every remaining call raises so we catch missed callsites in testing. All
+# aggregations now run locally on the DataFrame returned by `year_df(year)`.
+# ---------------------------------------------------------------------------
+def sql_query(sql: str, timeout: int = HTTP_TIMEOUT) -> pd.DataFrame | None:
+    st.session_state["_last_api_error"] = (
+        "sql_query() fue invocado pero el endpoint SQL fue deshabilitado. "
+        "Esta función ya no se usa — re-chequear callsites."
+    )
+    _log_query(sql, 0.0, 0, "SQL endpoint disabled")
+    return None
 
 
 def sql_escape(value: str) -> str:
@@ -141,29 +654,31 @@ def coerce_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Cached data accessors
+# Cached data accessors — all operate on the in-memory DataFrame from load_year()
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_latest_data_date(year: int) -> tuple[int, int] | None:
-    """Última fecha (anio, mes) con registros en el resource del año dado."""
-    rid = RESOURCES_BY_YEAR.get(year)
-    if rid is None:
-        return None
-    sql = f'SELECT MAX("anio"*100+"mes") AS ym FROM "{rid}"'
-    df = sql_query(sql, timeout=15)
+def _empty_df(cols: list[str]) -> pd.DataFrame:
+    return pd.DataFrame(columns=cols)
+
+
+def _filter_valid_yac(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows with missing/empty areayacimiento."""
     if df is None or df.empty:
+        return df
+    yac = df["areayacimiento"].fillna("").astype(str).str.strip()
+    return df[yac != ""]
+
+
+def get_latest_data_date(year: int) -> tuple[int, int] | None:
+    """Última fecha (anio, mes) con registros en el año dado."""
+    df = year_df(year)
+    if df is None or df.empty or "yyyymm" not in df.columns:
         return None
-    val = df.iloc[0].get("ym")
-    try:
-        ym = int(float(val))
-    except (TypeError, ValueError):
-        return None
+    ym = int(df["yyyymm"].max())
     if ym <= 0:
         return None
     return (ym // 100, ym % 100)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def get_latest_year_with_data() -> int:
     """El año más reciente (de RESOURCES_BY_YEAR) con datos publicados."""
     for y in sorted(RESOURCES_BY_YEAR.keys(), reverse=True):
@@ -174,55 +689,100 @@ def get_latest_year_with_data() -> int:
     return max(RESOURCES_BY_YEAR.keys())
 
 
+@st.cache_data(ttl=3600 * 24, show_spinner=False)
+def get_field_first_production(operator: str, yacimiento: str) -> tuple[int, int] | None:
+    """Primer (anio, mes) con petróleo o gas > 0 para este operador×yacimiento.
+
+    Recorre sólo los años ya cacheados en disco (para no forzar descargas pesadas).
+    """
+    op = str(operator).strip()
+    yac = str(yacimiento).strip()
+    for y in sorted(RESOURCES_BY_YEAR.keys()):
+        # Sólo usar años ya descargados en disco
+        if not _year_cache_path(y).exists():
+            continue
+        df = year_df(y)
+        if df is None or df.empty:
+            continue
+        m = (
+            (df["empresa"].fillna("").str.strip() == op)
+            & (df["areayacimiento"].fillna("").str.strip() == yac)
+            & ((df["prod_pet"].fillna(0) > 0) | (df["prod_gas"].fillna(0) > 0))
+        )
+        sub = df.loc[m, "yyyymm"]
+        if sub.empty:
+            continue
+        ym = int(sub.min())
+        if ym > 0:
+            return (ym // 100, ym % 100)
+    return None
+
+
+@st.cache_data(ttl=3600 * 6, show_spinner=False)
+def get_all_yacimientos(year: int) -> pd.DataFrame:
+    """Listado de yacimientos con su operador dominante para el año dado."""
+    df = year_df(year)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = _filter_valid_yac(df)
+    out = (
+        df.groupby(["areayacimiento", "empresa", "cuenca", "provincia"], dropna=False)
+        .agg(cum_oil=("prod_pet", "sum"), wells=("idpozo", "nunique"))
+        .reset_index()
+    )
+    return out.sort_values(
+        ["areayacimiento", "cum_oil"], ascending=[True, False]
+    ).reset_index(drop=True)
+
+
 @st.cache_data(ttl=3600 * 24, show_spinner="Cargando empresas operadoras...")
 def get_all_companies(year: int) -> list[str]:
-    rid = RESOURCES_BY_YEAR.get(year)
-    if rid is None:
-        return []
-    sql = f'SELECT DISTINCT "empresa" FROM "{rid}" ORDER BY "empresa"'
-    df = sql_query(sql)
+    df = year_df(year)
     if df is None or df.empty or "empresa" not in df.columns:
         return []
-    return [e for e in df["empresa"].dropna().tolist() if e.strip()]
+    vals = df["empresa"].dropna().astype(str).str.strip().unique().tolist()
+    return sorted([e for e in vals if e])
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_company_summary(company: str, year: int) -> dict:
-    rid = RESOURCES_BY_YEAR[year]
-    e = sql_escape(company)
-    sql = f"""
-        SELECT COUNT(DISTINCT "idpozo")   AS wells,
-               COUNT(DISTINCT "cuenca")   AS basins,
-               COUNT(DISTINCT "provincia") AS provinces,
-               SUM("prod_pet")            AS total_oil,
-               SUM("prod_gas")            AS total_gas,
-               SUM("prod_agua")           AS total_water
-        FROM "{rid}" WHERE "empresa" = '{e}'
-    """
-    df = sql_query(sql)
+    df = year_df(year)
     if df is None or df.empty:
         return {}
-    row = df.iloc[0].to_dict()
-    return {k: pd.to_numeric(v, errors="coerce") for k, v in row.items()}
+    sub = df[df["empresa"].fillna("").str.strip() == str(company).strip()]
+    if sub.empty:
+        return {}
+    return {
+        "wells": sub["idpozo"].nunique(),
+        "basins": sub["cuenca"].nunique(),
+        "provinces": sub["provincia"].nunique(),
+        "total_oil": float(sub["prod_pet"].sum()),
+        "total_gas": float(sub["prod_gas"].sum()),
+        "total_water": float(sub["prod_agua"].sum()),
+    }
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_company_basin_rollup(company: str, year: int) -> pd.DataFrame:
-    rid = RESOURCES_BY_YEAR[year]
-    e = sql_escape(company)
-    sql = f"""
-        SELECT "cuenca",
-               COUNT(DISTINCT "idpozo") AS wells,
-               SUM("prod_pet") AS oil,
-               SUM("prod_gas") AS gas,
-               SUM("prod_agua") AS water
-        FROM "{rid}" WHERE "empresa" = '{e}'
-        GROUP BY "cuenca" ORDER BY oil DESC NULLS LAST
-    """
-    df = sql_query(sql)
-    if df is None:
+    df = year_df(year)
+    if df is None or df.empty:
         return pd.DataFrame()
-    return coerce_numeric(df, ["wells", "oil", "gas", "water"])
+    sub = df[df["empresa"].fillna("").str.strip() == str(company).strip()]
+    if sub.empty:
+        return pd.DataFrame()
+    out = (
+        sub.groupby("cuenca", dropna=False)
+        .agg(
+            wells=("idpozo", "nunique"),
+            oil=("prod_pet", "sum"),
+            gas=("prod_gas", "sum"),
+            water=("prod_agua", "sum"),
+        )
+        .reset_index()
+        .sort_values("oil", ascending=False, na_position="last")
+        .reset_index(drop=True)
+    )
+    return out
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -231,36 +791,38 @@ def get_company_wells(
     tipo_recurso: str | None = None, provincia: str | None = None,
     yacimiento: str | None = None,
 ) -> pd.DataFrame:
-    rid = RESOURCES_BY_YEAR[year]
-    e = sql_escape(company)
-    where = [f'"empresa" = \'{e}\'']
-    if basin:
-        where.append(f'"cuenca" = \'{sql_escape(basin)}\'')
-    if tipo_recurso:
-        where.append(f'"tipo_de_recurso" = \'{sql_escape(tipo_recurso)}\'')
-    if provincia:
-        where.append(f'"provincia" = \'{sql_escape(provincia)}\'')
-    if yacimiento:
-        where.append(f'"areayacimiento" = \'{sql_escape(yacimiento)}\'')
-    where_clause = " AND ".join(where)
-    sql = f"""
-        SELECT "idpozo","sigla","cuenca","provincia","tipo_de_recurso",
-               "areayacimiento","formacion",
-               SUM("prod_pet")  AS cum_oil,
-               SUM("prod_gas")  AS cum_gas,
-               SUM("prod_agua") AS cum_water,
-               MAX("prod_pet")  AS peak_oil,
-               COUNT(*)          AS months,
-               SUM("tef")        AS total_tef
-        FROM "{rid}" WHERE {where_clause}
-        GROUP BY "idpozo","sigla","cuenca","provincia","tipo_de_recurso",
-                 "areayacimiento","formacion"
-        ORDER BY cum_oil DESC NULLS LAST
-    """
-    df = sql_query(sql)
-    if df is None:
+    df = year_df(year)
+    if df is None or df.empty:
         return pd.DataFrame()
-    return coerce_numeric(df, ["cum_oil", "cum_gas", "cum_water", "peak_oil", "months", "total_tef"])
+    m = df["empresa"].fillna("").str.strip() == str(company).strip()
+    if basin:
+        m &= df["cuenca"].fillna("").str.strip() == str(basin).strip()
+    if tipo_recurso:
+        m &= df["tipo_de_recurso"].fillna("").str.strip() == str(tipo_recurso).strip()
+    if provincia:
+        m &= df["provincia"].fillna("").str.strip() == str(provincia).strip()
+    if yacimiento:
+        m &= df["areayacimiento"].fillna("").str.strip() == str(yacimiento).strip()
+    sub = df[m]
+    if sub.empty:
+        return pd.DataFrame()
+    group_cols = ["idpozo", "sigla", "cuenca", "provincia", "tipo_de_recurso",
+                  "areayacimiento", "formacion"]
+    out = (
+        sub.groupby(group_cols, dropna=False)
+        .agg(
+            cum_oil=("prod_pet", "sum"),
+            cum_gas=("prod_gas", "sum"),
+            cum_water=("prod_agua", "sum"),
+            peak_oil=("prod_pet", "max"),
+            months=("prod_pet", "size"),
+            total_tef=("tef", "sum"),
+        )
+        .reset_index()
+        .sort_values("cum_oil", ascending=False, na_position="last")
+        .reset_index(drop=True)
+    )
+    return out
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -269,98 +831,68 @@ def get_company_fields(
     tipo_recurso: str | None = None, provincia: str | None = None,
 ) -> pd.DataFrame:
     """Yacimiento-level rollup for a company (optionally scoped to basin/tipo/province)."""
-    rid = RESOURCES_BY_YEAR[year]
-    e = sql_escape(company)
-    where = [f'"empresa" = \'{e}\'',
-             '"areayacimiento" IS NOT NULL',
-             "\"areayacimiento\" != ''"]
-    if basin:
-        where.append(f'"cuenca" = \'{sql_escape(basin)}\'')
-    if tipo_recurso:
-        where.append(f'"tipo_de_recurso" = \'{sql_escape(tipo_recurso)}\'')
-    if provincia:
-        where.append(f'"provincia" = \'{sql_escape(provincia)}\'')
-    where_clause = " AND ".join(where)
-
-    # Q1: totals + distinct well count per yacimiento
-    sql1 = f"""
-        SELECT "areayacimiento","cuenca","provincia",
-               COUNT(DISTINCT "idpozo") AS wells,
-               SUM("prod_pet")  AS cum_oil,
-               SUM("prod_gas")  AS cum_gas,
-               SUM("prod_agua") AS cum_water,
-               SUM("tef")        AS total_tef
-        FROM "{rid}" WHERE {where_clause}
-        GROUP BY "areayacimiento","cuenca","provincia"
-    """
-    df_tot = sql_query(sql1)
-    if df_tot is None or df_tot.empty:
+    df = year_df(year)
+    if df is None or df.empty:
         return pd.DataFrame()
-    df_tot = coerce_numeric(df_tot, ["wells", "cum_oil", "cum_gas", "cum_water", "total_tef"])
+    df = _filter_valid_yac(df)
+    m = df["empresa"].fillna("").str.strip() == str(company).strip()
+    if basin:
+        m &= df["cuenca"].fillna("").str.strip() == str(basin).strip()
+    if tipo_recurso:
+        m &= df["tipo_de_recurso"].fillna("").str.strip() == str(tipo_recurso).strip()
+    if provincia:
+        m &= df["provincia"].fillna("").str.strip() == str(provincia).strip()
+    sub = df[m]
+    if sub.empty:
+        return pd.DataFrame()
 
-    # Q2: consolidated monthly peak per yacimiento (via CTE)
-    sql2 = f"""
-        SELECT "areayacimiento",
-               MAX(oil_month) AS peak_oil_month,
-               MAX(gas_month) AS peak_gas_month,
-               MAX(wells_month) AS peak_concurrent_wells,
-               COUNT(*) AS n_months,
-               MAX("anio" * 100 + "mes") AS last_yyyymm
-        FROM (
-            SELECT "areayacimiento","anio","mes",
-                   SUM("prod_pet") AS oil_month,
-                   SUM("prod_gas") AS gas_month,
-                   COUNT(DISTINCT "idpozo") AS wells_month
-            FROM "{rid}" WHERE {where_clause}
-            GROUP BY "areayacimiento","anio","mes"
-        ) m
-        GROUP BY "areayacimiento"
-    """
-    df_peak = sql_query(sql2)
-    if df_peak is None:
-        df_peak = pd.DataFrame(columns=["areayacimiento", "peak_oil_month", "peak_gas_month",
-                                        "peak_concurrent_wells", "n_months", "last_yyyymm"])
-    df_peak = coerce_numeric(df_peak, ["peak_oil_month", "peak_gas_month",
-                                       "peak_concurrent_wells", "n_months", "last_yyyymm"])
+    # Totals per yacimiento
+    df_tot = (
+        sub.groupby(["areayacimiento", "cuenca", "provincia"], dropna=False)
+        .agg(
+            wells=("idpozo", "nunique"),
+            cum_oil=("prod_pet", "sum"),
+            cum_gas=("prod_gas", "sum"),
+            cum_water=("prod_agua", "sum"),
+            total_tef=("tef", "sum"),
+        )
+        .reset_index()
+    )
 
-    # Q3: last-month production per yacimiento
-    sql3 = f"""
-        SELECT "areayacimiento", "anio", "mes",
-               SUM("prod_pet") AS oil_last, SUM("prod_gas") AS gas_last,
-               SUM("tef") AS tef_last
-        FROM "{rid}" WHERE {where_clause}
-          AND ("anio" * 100 + "mes") IN (
-                SELECT MAX("anio" * 100 + "mes") FROM "{rid}"
-                WHERE {where_clause} GROUP BY "areayacimiento"
-              )
-        GROUP BY "areayacimiento","anio","mes"
-    """
-    df_last = sql_query(sql3)
-    if df_last is None:
-        df_last = pd.DataFrame(columns=["areayacimiento", "anio", "mes",
-                                        "oil_last", "gas_last", "tef_last"])
-    df_last = coerce_numeric(df_last, ["anio", "mes", "oil_last", "gas_last", "tef_last"])
-    # The subquery above may return the last month across ALL yacimientos rather than per one.
-    # To be safe, recompute last-month per yacimiento in pandas from a simpler query:
-    sql3b = f"""
-        SELECT "areayacimiento", "anio", "mes",
-               SUM("prod_pet") AS oil_m, SUM("prod_gas") AS gas_m, SUM("tef") AS tef_m
-        FROM "{rid}" WHERE {where_clause}
-        GROUP BY "areayacimiento","anio","mes"
-    """
-    df_m = sql_query(sql3b)
-    if df_m is not None and not df_m.empty:
-        df_m = coerce_numeric(df_m, ["anio", "mes", "oil_m", "gas_m", "tef_m"])
-        df_m["yyyymm"] = df_m["anio"].fillna(0).astype(int) * 100 + df_m["mes"].fillna(0).astype(int)
-        idx = df_m.groupby("areayacimiento")["yyyymm"].idxmax()
-        df_last = df_m.loc[idx, ["areayacimiento", "anio", "mes", "oil_m", "gas_m", "tef_m"]]
-        df_last = df_last.rename(columns={"oil_m": "oil_last", "gas_m": "gas_last", "tef_m": "tef_last"})
+    # Monthly rollup per (yacimiento, anio, mes)
+    df_m = (
+        sub.groupby(["areayacimiento", "anio", "mes"], dropna=False)
+        .agg(
+            oil_month=("prod_pet", "sum"),
+            gas_month=("prod_gas", "sum"),
+            tef_month=("tef", "sum"),
+            wells_month=("idpozo", "nunique"),
+        )
+        .reset_index()
+    )
+    df_m["yyyymm"] = df_m["anio"].fillna(0).astype(int) * 100 + df_m["mes"].fillna(0).astype(int)
 
-    # Merge all pieces
+    df_peak = (
+        df_m.groupby("areayacimiento", dropna=False)
+        .agg(
+            peak_oil_month=("oil_month", "max"),
+            peak_gas_month=("gas_month", "max"),
+            peak_concurrent_wells=("wells_month", "max"),
+            n_months=("yyyymm", "nunique"),
+            last_yyyymm=("yyyymm", "max"),
+        )
+        .reset_index()
+    )
+
+    idx = df_m.groupby("areayacimiento")["yyyymm"].idxmax()
+    df_last = df_m.loc[idx, ["areayacimiento", "anio", "mes",
+                             "oil_month", "gas_month", "tef_month"]].rename(
+        columns={"oil_month": "oil_last", "gas_month": "gas_last", "tef_month": "tef_last",
+                 "anio": "last_anio", "mes": "last_mes"}
+    )
+
     out = df_tot.merge(df_peak, on="areayacimiento", how="left")
-    out = out.merge(df_last[["areayacimiento", "oil_last", "gas_last", "tef_last", "anio", "mes"]],
-                    on="areayacimiento", how="left")
-    out = out.rename(columns={"anio": "last_anio", "mes": "last_mes"})
+    out = out.merge(df_last, on="areayacimiento", how="left")
     out = out.sort_values("cum_oil", ascending=False, na_position="last").reset_index(drop=True)
     return out
 
@@ -370,37 +902,42 @@ def get_field_timeseries(
     company: str, yacimiento: str, years: tuple[int, ...],
 ) -> pd.DataFrame:
     """Consolidated monthly production for a yacimiento (summed across its wells)."""
-    c = sql_escape(company)
-    y = sql_escape(yacimiento)
+    c = str(company).strip()
+    y = str(yacimiento).strip()
     parts = []
     for year in years:
-        rid = RESOURCES_BY_YEAR.get(year)
-        if not rid:
+        # Sólo años ya cacheados
+        if not _year_cache_path(year).exists():
             continue
-        sql = f"""
-            SELECT "anio","mes",
-                   SUM("prod_pet")  AS oil,
-                   SUM("prod_gas")  AS gas,
-                   SUM("prod_agua") AS water,
-                   SUM("tef")        AS tef,
-                   COUNT(DISTINCT "idpozo") AS wells
-            FROM "{rid}"
-            WHERE "empresa" = '{c}' AND "areayacimiento" = '{y}'
-            GROUP BY "anio","mes" ORDER BY "anio","mes"
-        """
-        df = sql_query(sql)
-        if df is not None and not df.empty:
-            parts.append(df)
+        df = year_df(year)
+        if df is None or df.empty:
+            continue
+        sub = df[
+            (df["empresa"].fillna("").str.strip() == c)
+            & (df["areayacimiento"].fillna("").str.strip() == y)
+        ]
+        if sub.empty:
+            continue
+        g = (
+            sub.groupby(["anio", "mes"], dropna=False)
+            .agg(
+                oil=("prod_pet", "sum"),
+                gas=("prod_gas", "sum"),
+                water=("prod_agua", "sum"),
+                tef=("tef", "sum"),
+                wells=("idpozo", "nunique"),
+            )
+            .reset_index()
+        )
+        parts.append(g)
     if not parts:
         return pd.DataFrame()
     df = pd.concat(parts, ignore_index=True)
-    df = coerce_numeric(df, ["anio", "mes", "oil", "gas", "water", "tef", "wells"])
     df["fecha"] = pd.to_datetime(
         df["anio"].astype("Int64").astype(str) + "-" +
         df["mes"].astype("Int64").astype(str).str.zfill(2) + "-01",
         errors="coerce",
     )
-    # Days in month for BPD calendar calc
     df["days_in_month"] = df["fecha"].dt.days_in_month
     return df.sort_values("fecha").reset_index(drop=True)
 
@@ -408,103 +945,127 @@ def get_field_timeseries(
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_top_yacimientos(year: int, top: int = 10) -> pd.DataFrame:
     """Top yacimientos de Argentina por producción YTD — para el panel general."""
-    rid = RESOURCES_BY_YEAR[year]
-
-    # Q1: totals per (yacimiento, empresa, cuenca, provincia), top N × 3 for buffer
-    sql1 = f"""
-        SELECT "areayacimiento","empresa","cuenca","provincia",
-               COUNT(DISTINCT "idpozo") AS wells,
-               SUM("prod_pet")  AS cum_oil,
-               SUM("prod_gas")  AS cum_gas,
-               SUM("tef")       AS total_tef,
-               COUNT(DISTINCT "anio"*100+"mes") AS n_months,
-               MAX("anio"*100+"mes") AS last_yyyymm
-        FROM "{rid}"
-        WHERE "areayacimiento" IS NOT NULL AND "areayacimiento" != ''
-        GROUP BY "areayacimiento","empresa","cuenca","provincia"
-        ORDER BY cum_oil DESC NULLS LAST
-        LIMIT {int(top) * 3}
-    """
-    df = sql_query(sql1)
+    df = year_df(year)
     if df is None or df.empty:
         return pd.DataFrame()
-    df = coerce_numeric(df, ["wells", "cum_oil", "cum_gas", "total_tef", "n_months", "last_yyyymm"])
+    df = _filter_valid_yac(df)
 
-    # Keep the top N by cum_oil
-    df = df.sort_values("cum_oil", ascending=False, na_position="last").head(int(top)).reset_index(drop=True)
+    totals = (
+        df.groupby(["areayacimiento", "empresa", "cuenca", "provincia"], dropna=False)
+        .agg(
+            wells=("idpozo", "nunique"),
+            cum_oil=("prod_pet", "sum"),
+            cum_gas=("prod_gas", "sum"),
+            total_tef=("tef", "sum"),
+            n_months=("yyyymm", "nunique"),
+            last_yyyymm=("yyyymm", "max"),
+        )
+        .reset_index()
+        .sort_values("cum_oil", ascending=False, na_position="last")
+        .head(int(top))
+        .reset_index(drop=True)
+    )
+    if totals.empty:
+        return totals
 
-    # Q2: monthly rollup for just these top yacimientos — compute last-month BPD
-    yac_list = df["areayacimiento"].dropna().unique().tolist()
+    yac_list = totals["areayacimiento"].dropna().unique().tolist()
     if yac_list:
-        in_clause = ",".join("'" + sql_escape(y) + "'" for y in yac_list)
-        sql2 = f"""
-            SELECT "areayacimiento","empresa","anio","mes",
-                   SUM("prod_pet") AS oil_m, SUM("tef") AS tef_m,
-                   COUNT(DISTINCT "idpozo") AS wells_m
-            FROM "{rid}"
-            WHERE "areayacimiento" IN ({in_clause})
-            GROUP BY "areayacimiento","empresa","anio","mes"
-        """
-        df_m = sql_query(sql2)
-        if df_m is not None and not df_m.empty:
-            df_m = coerce_numeric(df_m, ["anio", "mes", "oil_m", "tef_m", "wells_m"])
-            df_m["yyyymm"] = (
-                df_m["anio"].fillna(0).astype(int) * 100
-                + df_m["mes"].fillna(0).astype(int)
+        sub = df[df["areayacimiento"].isin(yac_list)]
+        df_m = (
+            sub.groupby(["areayacimiento", "empresa", "anio", "mes"], dropna=False)
+            .agg(
+                oil_m=("prod_pet", "sum"),
+                tef_m=("tef", "sum"),
+                wells_m=("idpozo", "nunique"),
             )
+            .reset_index()
+        )
+        df_m["yyyymm"] = df_m["anio"].fillna(0).astype(int) * 100 + df_m["mes"].fillna(0).astype(int)
+        if not df_m.empty:
             idx = df_m.groupby(["areayacimiento", "empresa"])["yyyymm"].idxmax()
             df_last = df_m.loc[idx, ["areayacimiento", "empresa", "anio", "mes",
                                      "oil_m", "tef_m", "wells_m"]].rename(
                 columns={"oil_m": "oil_last", "tef_m": "tef_last", "wells_m": "wells_last",
                          "anio": "last_anio", "mes": "last_mes"})
-            df = df.merge(df_last, on=["areayacimiento", "empresa"], how="left")
+            totals = totals.merge(df_last, on=["areayacimiento", "empresa"], how="left")
 
-    return df
+    return totals
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_basin_field_totals(basin: str, year: int) -> pd.DataFrame:
-    """Cumulative oil per yacimiento in a basin — for P10/P50/P90 benchmarks."""
-    rid = RESOURCES_BY_YEAR[year]
-    e = sql_escape(basin)
-    sql = f"""
-        SELECT "areayacimiento", "empresa",
-               COUNT(DISTINCT "idpozo") AS wells,
-               SUM("prod_pet") AS cum_oil,
-               SUM("prod_gas") AS cum_gas
-        FROM "{rid}"
-        WHERE "cuenca" = '{e}' AND "areayacimiento" IS NOT NULL AND "areayacimiento" != ''
-        GROUP BY "areayacimiento", "empresa"
-    """
-    df = sql_query(sql)
-    if df is None:
+    """Per-yacimiento rollup for a basin — includes monthly breakdown so we can
+    compute both YTD BPD and last-month BPD for benchmarks."""
+    df = year_df(year)
+    if df is None or df.empty:
         return pd.DataFrame()
-    return coerce_numeric(df, ["wells", "cum_oil", "cum_gas"])
+    df = _filter_valid_yac(df)
+    sub = df[df["cuenca"].fillna("").str.strip() == str(basin).strip()]
+    if sub.empty:
+        return pd.DataFrame()
+    df_m = (
+        sub.groupby(["areayacimiento", "empresa", "anio", "mes"], dropna=False)
+        .agg(
+            wells_m=("idpozo", "nunique"),
+            oil_m=("prod_pet", "sum"),
+            gas_m=("prod_gas", "sum"),
+        )
+        .reset_index()
+    )
+    df_m["yyyymm"] = df_m["anio"].fillna(0).astype(int) * 100 + df_m["mes"].fillna(0).astype(int)
+
+    # Totals per (yacimiento, empresa)
+    totals = (
+        df_m.groupby(["areayacimiento", "empresa"], as_index=False)
+        .agg(
+            wells=("wells_m", "max"),  # usamos el pico concurrente del año
+            cum_oil=("oil_m", "sum"),
+            cum_gas=("gas_m", "sum"),
+            n_months=("yyyymm", "nunique"),
+            last_yyyymm=("yyyymm", "max"),
+        )
+    )
+
+    # Last-month slice
+    idx = df_m.groupby(["areayacimiento", "empresa"])["yyyymm"].idxmax()
+    last = df_m.loc[idx, ["areayacimiento", "empresa", "oil_m", "wells_m", "anio", "mes"]].rename(
+        columns={"oil_m": "oil_last", "wells_m": "wells_last",
+                 "anio": "last_anio", "mes": "last_mes"}
+    )
+    out = totals.merge(last, on=["areayacimiento", "empresa"], how="left")
+
+    # Días del último mes (para BPD calendario del último mes)
+    def _dim(row):
+        try:
+            return pd.Timestamp(int(row["last_anio"]), int(row["last_mes"]), 1).days_in_month
+        except Exception:
+            return 30.44
+    out["last_days"] = out.apply(_dim, axis=1)
+    return out
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_well_timeseries(idpozo: str, years: tuple[int, ...]) -> pd.DataFrame:
     """Fetch monthly time series for one well across one or more years."""
     parts = []
-    idpozo_e = sql_escape(str(idpozo))
+    idp = str(idpozo).strip()
+    cols = ["anio", "mes", "prod_pet", "prod_gas", "prod_agua", "tef",
+            "empresa", "sigla", "cuenca", "provincia", "tipo_de_recurso",
+            "areayacimiento", "formacion", "tipoestado", "tipoextraccion"]
     for y in years:
-        rid = RESOURCES_BY_YEAR.get(y)
-        if not rid:
+        if not _year_cache_path(y).exists():
             continue
-        sql = f"""
-            SELECT "anio","mes","prod_pet","prod_gas","prod_agua","tef",
-                   "empresa","sigla","cuenca","provincia","tipo_de_recurso",
-                   "areayacimiento","formacion","tipoestado","tipoextraccion"
-            FROM "{rid}" WHERE "idpozo" = '{idpozo_e}'
-        """
-        df = sql_query(sql)
-        if df is not None and not df.empty:
-            parts.append(df)
+        df = year_df(y)
+        if df is None or df.empty:
+            continue
+        sub = df[df["idpozo"].astype(str).str.strip() == idp]
+        if sub.empty:
+            continue
+        keep = [c for c in cols if c in sub.columns]
+        parts.append(sub[keep].copy())
     if not parts:
         return pd.DataFrame()
     df = pd.concat(parts, ignore_index=True)
-    df = coerce_numeric(df, ["anio", "mes", "prod_pet", "prod_gas", "prod_agua", "tef"])
-    # Build date column
     df["fecha"] = pd.to_datetime(
         df["anio"].astype("Int64").astype(str) + "-" + df["mes"].astype("Int64").astype(str).str.zfill(2) + "-01",
         errors="coerce",
@@ -514,46 +1075,45 @@ def get_well_timeseries(idpozo: str, years: tuple[int, ...]) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600 * 24, show_spinner=False)
 def get_well_padron(sigla: str) -> dict:
-    e = sql_escape(sigla)
-    sql = f'SELECT * FROM "{PADRON_RESOURCE}" WHERE "sigla" = \'{e}\' LIMIT 1'
-    df = sql_query(sql)
-    if df is None or df.empty:
-        return {}
-    return df.iloc[0].to_dict()
+    # El padrón es un resource aparte y no se bulk-fetchea: stub vacío por ahora.
+    return {}
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_basin_well_totals(basin: str, year: int) -> pd.DataFrame:
     """Cumulative oil per well across the entire basin — for P10/P50/P90 and ranking."""
-    rid = RESOURCES_BY_YEAR[year]
-    e = sql_escape(basin)
-    sql = f"""
-        SELECT "idpozo","sigla","empresa",
-               SUM("prod_pet") AS cum_oil
-        FROM "{rid}" WHERE "cuenca" = '{e}'
-        GROUP BY "idpozo","sigla","empresa"
-    """
-    df = sql_query(sql)
-    if df is None:
+    df = year_df(year)
+    if df is None or df.empty:
         return pd.DataFrame()
-    return coerce_numeric(df, ["cum_oil"])
+    sub = df[df["cuenca"].fillna("").str.strip() == str(basin).strip()]
+    if sub.empty:
+        return pd.DataFrame()
+    out = (
+        sub.groupby(["idpozo", "sigla", "empresa"], dropna=False)
+        .agg(cum_oil=("prod_pet", "sum"))
+        .reset_index()
+    )
+    return out
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_basin_operator_leaderboard(basin: str | None, year: int, top: int = 5) -> pd.DataFrame:
-    rid = RESOURCES_BY_YEAR[year]
-    where = f'WHERE "cuenca" = \'{sql_escape(basin)}\'' if basin else ""
-    sql = f"""
-        SELECT "empresa",
-               COUNT(DISTINCT "idpozo") AS wells,
-               SUM("prod_pet") AS oil
-        FROM "{rid}" {where}
-        GROUP BY "empresa" ORDER BY oil DESC NULLS LAST LIMIT {top}
-    """
-    df = sql_query(sql)
-    if df is None:
+    df = year_df(year)
+    if df is None or df.empty:
         return pd.DataFrame()
-    return coerce_numeric(df, ["wells", "oil"])
+    if basin:
+        df = df[df["cuenca"].fillna("").str.strip() == str(basin).strip()]
+    if df.empty:
+        return pd.DataFrame()
+    out = (
+        df.groupby("empresa", dropna=False)
+        .agg(wells=("idpozo", "nunique"), oil=("prod_pet", "sum"))
+        .reset_index()
+        .sort_values("oil", ascending=False, na_position="last")
+        .head(int(top))
+        .reset_index(drop=True)
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -563,10 +1123,10 @@ def quality_pill(val: float, p33: float, p66: float) -> str:
     if pd.isna(val):
         return "—"
     if val >= p66:
-        return "🟢"
+        return "Alta"
     if val >= p33:
-        return "🟠"
-    return "🔴"
+        return "Media"
+    return "Baja"
 
 
 def compute_decline_rate(series: pd.Series) -> float:
@@ -622,6 +1182,8 @@ def fmt_m3(x: float) -> str:
 # Barrel conversions
 # ---------------------------------------------------------------------------
 M3_TO_BBL = 6.2898  # 1 cubic metre = 6.2898 US oil barrels
+
+EARTH_PALETTE = ["#5C3D2E", "#7B5B47", "#B8A89A", "#D4C5B0", "#2C1810", "#8B6355", "#A07060"]
 
 def m3_to_bbl(m3: float) -> float:
     return (m3 or 0) * M3_TO_BBL
@@ -703,7 +1265,7 @@ st.session_state.setdefault("include_prior_year", True)
 # Sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### ⚙️ Configuración")
+    st.markdown("### Configuración")
     years_available = sorted(RESOURCES_BY_YEAR.keys(), reverse=True)
     year = st.selectbox(
         "Año de producción",
@@ -713,8 +1275,17 @@ with st.sidebar:
     )
     if year != st.session_state["year"]:
         st.session_state["year"] = year
+        # Limpiar TODO el estado de navegación: si no, al cambiar de año se
+        # arrastra el operador/yacimiento/pozo/cuenca del año anterior y
+        # parece que los datos se "mezclan" entre años.
         st.session_state["selected_operator"] = None
+        st.session_state["selected_basin"] = None
+        st.session_state["selected_yacimiento"] = None
+        st.session_state["selected_well_id"] = None
+        st.session_state["selected_well_sigla"] = None
         st.session_state["screen"] = "operator"
+        # Invalidar caches in-memory de accessors @st.cache_data
+        st.cache_data.clear()
         st.rerun()
 
     include_prior = st.checkbox(
@@ -725,38 +1296,149 @@ with st.sidebar:
     st.session_state["include_prior_year"] = include_prior
 
     st.markdown("---")
+    # Mostrar estado del caché por año (desde el manifest)
+    _mani = _read_manifest()
+    _yr_key = str(st.session_state["year"])
+    _yr_info = _mani.get(_yr_key)
+    if _yr_info:
+        _dl = _yr_info.get("downloaded_at", "—")
+        _rows = _yr_info.get("rows", 0)
+        st.caption(f"Caché local ({_yr_key}): {int(_rows):,} filas · bajado {_dl}")
+    else:
+        st.caption(f"Caché local ({_yr_key}): sin descarga previa")
+
     if st.button(
-        "🔄 Actualizar datos ahora",
-        use_container_width=True,
-        help="Limpia el caché y re-consulta al API de la Secretaría de Energía.",
+        f"Actualizar datos {LIVE_YEAR}",
+        width="stretch",
+        help=f"Re-descarga {LIVE_YEAR} (el año vivo) desde datos.energia.gob.ar. "
+             f"Los años anteriores son históricos estáticos y no se vuelven a bajar.",
     ):
-        st.cache_data.clear()
-        st.session_state["_last_refresh"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.rerun()
+        _yr = LIVE_YEAR
+        _prog = st.progress(0.0, text=f"Descargando {_yr} desde datos.energia.gob.ar…")
+
+        def _cb(done: int, total: int | None) -> None:
+            if total and total > 0:
+                frac = min(done / total, 1.0)
+                _prog.progress(frac, text=f"Descargando {_yr}: {done:,} / {total:,} filas")
+            else:
+                _prog.progress(0.0, text=f"Descargando {_yr}: {done:,} filas…")
+
+        try:
+            df_new = load_year(_yr, force=True, progress_cb=_cb)
+            if df_new is None or df_new.empty:
+                _prog.empty()
+                st.error("No se pudo descargar. Revisá el error en la barra lateral.")
+            else:
+                _prog.progress(1.0, text=f"Listo: {len(df_new):,} filas guardadas en caché.")
+                # Invalidar caché en memoria bumpeando token
+                st.session_state["_cache_token"] = datetime.now().isoformat(timespec="seconds")
+                st.cache_data.clear()
+                st.session_state["_last_refresh"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.rerun()
+        except Exception as e:
+            _prog.empty()
+            st.error(f"Falló la descarga: {e}")
+
     if st.session_state.get("_last_refresh"):
         st.caption(f"Última actualización manual: {st.session_state['_last_refresh']}")
+
+    # --- Fallback: cargar desde CSV local ---
+    with st.expander("Cargar desde CSV local (si la API falla)", expanded=False):
+        _found = scan_local_csvs()
+        if not _found:
+            st.caption(
+                "No encontré CSVs en: `/Users/Manuel/Desktop/Macro PM`, "
+                "`csv_downloads/`, `~/Downloads`. Bajá el CSV desde "
+                "datos.energia.gob.ar y dejalo en alguna de esas carpetas."
+            )
+        else:
+            _opts = {f"{y} — {p.name} ({p.stat().st_size/1e6:.0f} MB)": (y, p)
+                     for y, p in _found.items()}
+            # Mostrar estado de caché al lado de cada CSV — "importado" solo si
+            # manifest Y archivo parquet/pickle existen en disco.
+            _mani_state = _read_manifest()
+            _rows = []
+            for _lbl, (_y, _p) in _opts.items():
+                _cache_file = _year_cache_path(_y)
+                _cached = str(_y) in _mani_state and _cache_file.exists()
+                _rows.append(f"- **{_y}** · {_p.name} · {_p.stat().st_size/1e6:.0f} MB · "
+                             f"{'ya importado' if _cached else 'pendiente'}")
+            st.markdown("\n".join(_rows))
+
+            _pick = st.selectbox("Importar un año específico", list(_opts.keys()), key="csv_pick")
+            col_imp1, col_imp2 = st.columns(2)
+            with col_imp1:
+                _do_one = st.button("Importar este", width="stretch", key="csv_import_btn")
+            with col_imp2:
+                _do_all = st.button("Importar TODOS los pendientes",
+                                    width="stretch", key="csv_import_all_btn",
+                                    help="Salta años que ya estén en caché.")
+
+            if _do_one or _do_all:
+                if _do_all:
+                    _targets = [(y, p) for y, p in _found.items()
+                                if not (str(y) in _mani_state and _year_cache_path(y).exists())]
+                    if not _targets:
+                        st.success("Todos los años detectados ya están en caché.")
+                        _targets = []
+                else:
+                    _targets = [_opts[_pick]]
+
+                _prog = st.progress(0.0, text="Iniciando…")
+                _ok = 0
+                for _i, (_yr, _path) in enumerate(_targets):
+                    _prog.progress(_i / max(len(_targets), 1),
+                                   text=f"[{_i+1}/{len(_targets)}] Leyendo {_path.name}…")
+                    try:
+                        df_new = load_year_from_csv(_yr, _path, progress_cb=None)
+                        if df_new is not None and not df_new.empty:
+                            _ok += 1
+                    except Exception as e:
+                        st.warning(f"Falló {_yr}: {e}")
+
+                if _targets:
+                    _prog.progress(1.0, text=f"Listo: {_ok}/{len(_targets)} años importados.")
+                    st.session_state["_cache_token"] = datetime.now().isoformat(timespec="seconds")
+                    st.cache_data.clear()
+                    st.session_state["_last_refresh"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    st.rerun()
 
     st.markdown("---")
     _sb_last = get_latest_data_date(st.session_state["year"])
     _sb_last_str = fmt_last_date(_sb_last)
     st.markdown(
         f"""<div class='muted'>
-        Datos en vivo del portal oficial <b>datos.energia.gob.ar</b> —
-        Secretaría de Energía, Capítulo IV (producción mensual por pozo).<br>
+        Datos del portal oficial <b>datos.energia.gob.ar</b> —
+        Secretaría de Energía, Capítulo IV (producción mensual por pozo).
+        El año vivo ({LIVE_YEAR}) se actualiza con <i>Actualizar datos {LIVE_YEAR}</i>;
+        los años anteriores son históricos y se cargan una sola vez vía CSV.<br>
         <b>Último dato publicado:</b> {_sb_last_str}
         </div>""",
         unsafe_allow_html=True,
     )
+    st.caption(f"TLS: {TLS_MODE}")
+
     if st.session_state.get("_last_api_error"):
         with st.expander("Último error de API", expanded=False):
             st.code(st.session_state["_last_api_error"])
+
+    _qlog = st.session_state.get("_query_log") or []
+    if _qlog:
+        with st.expander(f"Log de consultas ({len(_qlog)})", expanded=False):
+            q_df = pd.DataFrame(_qlog[::-1])  # most recent first
+            st.caption(
+                f"Promedio: {int(np.mean([q['ms'] for q in _qlog]))} ms · "
+                f"Máx: {max(q['ms'] for q in _qlog)} ms · "
+                f"Errores: {sum(1 for q in _qlog if q['error'])}"
+            )
+            st.dataframe(q_df, width="stretch", hide_index=True, height=200)
 
 
 # ---------------------------------------------------------------------------
 # SCREEN 1 — Operator selector
 # ---------------------------------------------------------------------------
 def screen_operator() -> None:
-    st.title("🛢️ Argentina Well Intelligence Dashboard")
+    st.title("Argentina Well Intelligence Dashboard")
     last_date = get_latest_data_date(st.session_state["year"])
     last_str = fmt_last_date(last_date)
     st.caption(
@@ -767,10 +1449,33 @@ def screen_operator() -> None:
 
     companies = get_all_companies(st.session_state["year"])
     if not companies:
-        st.error(
-            "No se pudo obtener la lista de empresas. "
-            "Verifique conectividad con datos.energia.gob.ar o revise el error en la barra lateral."
-        )
+        _mani_now = _read_manifest()
+        _has_cache = str(st.session_state["year"]) in _mani_now
+        _yr_sel = st.session_state["year"]
+        if not _has_cache:
+            if _yr_sel == LIVE_YEAR:
+                st.warning(
+                    f"No hay datos en caché local para {_yr_sel}. Apretá "
+                    f"**Actualizar datos {LIVE_YEAR}** en la barra lateral para "
+                    f"descargar desde datos.energia.gob.ar (toma 30-60 segundos). "
+                    f"Si la API sigue caída, bajá el CSV de {_yr_sel} a mano y usá "
+                    f"**Cargar desde CSV local**."
+                )
+            else:
+                st.warning(
+                    f"No hay datos en caché local para {_yr_sel} (año histórico). "
+                    f"En la barra lateral, expandí **Cargar desde CSV local** e importá "
+                    f"el archivo correspondiente."
+                )
+        else:
+            st.error(
+                f"El caché local de {_yr_sel} está pero no se pueden listar empresas. "
+                f"Probá re-importar el CSV de ese año o contactá al dev."
+            )
+        _err = st.session_state.get("_last_api_error")
+        if _err:
+            with st.expander("Detalle técnico del último error", expanded=True):
+                st.code(_err)
         return
 
     st.markdown(
@@ -778,24 +1483,68 @@ def screen_operator() -> None:
         f"{st.session_state['year']}."
     )
 
-    col_a, col_b = st.columns([3, 1])
-    with col_a:
-        selected = st.selectbox(
-            "Buscar empresa",
-            options=["-- Seleccioná una empresa --"] + companies,
-            index=0,
-            key="op_selector",
-            help="Escribí para filtrar (YPF, Vista, Pan American, Pampa, Tecpetrol...).",
-        )
-    with col_b:
-        st.metric("Total de empresas", len(companies))
+    # ---------- Buscadores: empresa & yacimiento ----------
+    tab_emp, tab_yac = st.tabs(["Buscar por empresa", "Buscar por yacimiento"])
+
+    with tab_emp:
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            selected = st.selectbox(
+                "Empresa",
+                options=["-- Seleccioná una empresa --"] + companies,
+                index=0,
+                key="op_selector",
+                help="Escribí para filtrar (YPF, Vista, Pan American, Pampa, Tecpetrol...).",
+            )
+        with col_b:
+            st.metric("Total empresas", len(companies))
+
+    with tab_yac:
+        yac_df = get_all_yacimientos(st.session_state["year"])
+        if yac_df.empty:
+            st.info("No se pudo cargar el listado de yacimientos.")
+            yac_pick = "-- Elegir --"
+        else:
+            # Formato dropdown: "LOMA CAMPANA — YPF S.A. (Neuquina)"
+            yac_df = yac_df.copy()
+            yac_df["label"] = (
+                yac_df["areayacimiento"].astype(str)
+                + "  —  " + yac_df["empresa"].astype(str)
+                + "  (" + yac_df["cuenca"].astype(str).str.title() + ")"
+            )
+            col_y1, col_y2 = st.columns([3, 1])
+            with col_y1:
+                yac_pick = st.selectbox(
+                    "Yacimiento",
+                    options=["-- Elegir --"] + yac_df["label"].tolist(),
+                    index=0,
+                    key="yac_selector",
+                    help=(
+                        "Escribí parte del nombre. Ej: 'Loma Campana', 'Bandurria', "
+                        "'El Trapial'. Te lleva directo al detalle consolidado."
+                    ),
+                )
+            with col_y2:
+                st.metric(
+                    "Yacimientos",
+                    f"{yac_df['areayacimiento'].nunique():,}",
+                )
+        if yac_pick != "-- Elegir --":
+            row = yac_df[yac_df["label"] == yac_pick].iloc[0]
+            navigate(
+                "field_detail",
+                selected_operator=row["empresa"],
+                selected_yacimiento=row["areayacimiento"],
+                selected_basin=row["cuenca"],
+            )
+            st.rerun()
 
     if selected.startswith("--"):
         # ---------- Pulso del país: top yacimientos ----------
         year_cur = st.session_state["year"]
         last_ranking = get_latest_data_date(year_cur)
         last_ranking_str = fmt_last_date(last_ranking)
-        st.markdown(f"### 🏆 Top 10 yacimientos de Argentina · YTD {year_cur}")
+        st.markdown(f"### Top 10 yacimientos de Argentina · YTD {year_cur}")
         st.caption(
             f"Ranking por petróleo acumulado en {year_cur} · "
             f"Último mes publicado: **{last_ranking_str}** · "
@@ -818,6 +1567,20 @@ def screen_operator() -> None:
             else:
                 t["bpd_last"] = 0.0
 
+            # Tendencia: último vs YTD
+            t["trend_ratio"] = np.where(
+                t["bpd_ytd"] > 0, t["bpd_last"] / t["bpd_ytd"], 0.0
+            )
+            def _arrow(r):
+                if r <= 0:
+                    return "—"
+                if r > 1.05:
+                    return "↑"
+                if r < 0.95:
+                    return "↓"
+                return "="
+            t["Tend."] = t["trend_ratio"].apply(_arrow)
+
             t.insert(0, "#", range(1, len(t) + 1))
             disp = t.rename(columns={
                 "areayacimiento": "Yacimiento",
@@ -828,20 +1591,24 @@ def screen_operator() -> None:
                 "cum_oil": "Petróleo YTD (m³)",
                 "bpd_ytd": "BPD YTD",
                 "bpd_last": "BPD últ. mes",
-                "cum_gas": "Gas (miles m³)",
+                "cum_gas": "Gas (MMm³)",
             })[["#", "Yacimiento", "Operador", "Cuenca", "Provincia",
-                "Pozos", "Petróleo YTD (m³)", "BPD YTD", "BPD últ. mes",
-                "Gas (miles m³)"]]
+                "Pozos", "Petróleo YTD (m³)", "BPD YTD", "BPD últ. mes", "Tend.",
+                "Gas (MMm³)"]]
 
-            for c in ["Petróleo YTD (m³)", "Gas (miles m³)"]:
-                disp[c] = disp[c].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+            disp["Gas (MMm³)"] = disp["Gas (MMm³)"].apply(
+                lambda v: f"{v/1000:,.2f}" if pd.notna(v) else "—"
+            )
+            disp["Petróleo YTD (m³)"] = disp["Petróleo YTD (m³)"].apply(
+                lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
+            )
             for c in ["BPD YTD", "BPD últ. mes"]:
                 disp[c] = disp[c].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
             disp["Pozos"] = disp["Pozos"].apply(
                 lambda v: f"{int(v):,}" if pd.notna(v) else "—"
             )
 
-            st.dataframe(disp, use_container_width=True, hide_index=True, height=400)
+            st.dataframe(disp, width="stretch", hide_index=True, height=400)
 
             # Totales de la vista
             total_bpd_ytd = t["bpd_ytd"].sum()
@@ -885,7 +1652,7 @@ def screen_operator() -> None:
                 top_disp["Petróleo (m³)"] = top_disp["Petróleo (m³)"].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
                 top_disp["Pozos"] = top_disp["Pozos"].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "—")
                 top_disp.index = range(1, len(top_disp) + 1)
-                st.dataframe(top_disp, use_container_width=True)
+                st.dataframe(top_disp, width="stretch")
         return
 
     st.session_state["selected_operator"] = selected
@@ -903,13 +1670,14 @@ def screen_operator() -> None:
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Pozos activos", fmt_int(summary.get("wells")))
     k2.metric("Petróleo (m³)", fmt_m3(summary.get("total_oil")))
-    k3.metric("Gas (miles m³)", fmt_m3(summary.get("total_gas")))
+    _g = summary.get("total_gas") or 0
+    k3.metric("Gas (MMm³)", f"{_g/1000:,.2f}" if _g else "—")
     k4.metric("Cuencas", fmt_int(summary.get("basins")))
 
     st.markdown("")
     b1, b2 = st.columns([3, 1])
     with b2:
-        if st.button("📊 Ver todos los yacimientos", type="primary", use_container_width=True):
+        if st.button("Ver todos los yacimientos", type="primary", width="stretch"):
             navigate("fields", selected_operator=selected, selected_basin=None)
             st.rerun()
 
@@ -930,14 +1698,14 @@ def screen_operator() -> None:
 <div class="basin-card">
     <h4>{row['cuenca']}</h4>
     <div class="meta">
-        <b>{int(wells):,}</b> pozos · {oil:,.0f} m³ petróleo · {gas:,.0f} miles m³ gas
+        <b>{int(wells):,}</b> pozos · {oil:,.0f} m³ petróleo · {gas/1000:,.2f} MMm³ gas
     </div>
 </div>
 """,
                 unsafe_allow_html=True,
             )
             st.progress(min(max(pct, 0), 1.0))
-            if st.button("Ver yacimientos →", key=f"basin_{row['cuenca']}", use_container_width=True):
+            if st.button("Ver yacimientos →", key=f"basin_{row['cuenca']}", width="stretch"):
                 navigate("fields", selected_operator=selected, selected_basin=row["cuenca"])
                 st.rerun()
 
@@ -956,7 +1724,7 @@ def screen_fields() -> None:
 
     back_col, _ = st.columns([2, 10])
     with back_col:
-        if st.button("← Volver a empresas", use_container_width=True, key="back_fields"):
+        if st.button("← Volver a empresas", width="stretch", key="back_fields"):
             navigate("operator")
             st.rerun()
     st.title(f"{operator}")
@@ -996,6 +1764,19 @@ def screen_fields() -> None:
     fields["bpd_last_month"] = fields["oil_last"] * M3_TO_BBL / 30.44
     # BPD peak month
     fields["bpd_peak_month"] = fields["peak_oil_month"] * M3_TO_BBL / 30.44
+    # Tendencia: último mes vs YTD
+    _trend_ratio = np.where(
+        fields["bpd_ytd"] > 0, fields["bpd_last_month"] / fields["bpd_ytd"], 0.0
+    )
+    def _arrow(r):
+        if r <= 0:
+            return "—"
+        if r > 1.05:
+            return "↑"
+        if r < 0.95:
+            return "↓"
+        return "="
+    fields["trend"] = [_arrow(r) for r in _trend_ratio]
 
     # Quality based on cum_oil percentiles
     if len(fields) >= 3:
@@ -1027,7 +1808,8 @@ def screen_fields() -> None:
             "bpd_ytd": "BPD YTD",
             "oil_last": "Últ. mes (m³)",
             "bpd_last_month": "BPD últ. mes",
-            "cum_gas": "Gas (miles m³)",
+            "trend": "Tend.",
+            "cum_gas": "Gas (MMm³)",
             "peak_oil_month": "Pico mes (m³)",
             "bpd_peak_month": "BPD pico",
             "n_months": "Meses",
@@ -1037,14 +1819,17 @@ def screen_fields() -> None:
         display = fields.rename(columns=display_cols)[list(display_cols.values())]
 
         # Formatting
-        for c in ["Petróleo (m³)", "Últ. mes (m³)", "Gas (miles m³)", "Pico mes (m³)"]:
+        for c in ["Petróleo (m³)", "Últ. mes (m³)", "Pico mes (m³)"]:
             display[c] = display[c].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+        display["Gas (MMm³)"] = display["Gas (MMm³)"].apply(
+            lambda v: f"{v/1000:,.2f}" if pd.notna(v) else "—"
+        )
         for c in ["BPD YTD", "BPD últ. mes", "BPD pico"]:
             display[c] = display[c].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
         for c in ["Pozos", "Meses"]:
             display[c] = display[c].apply(lambda v: f"{int(v):,}" if pd.notna(v) else "—")
 
-        st.dataframe(display, use_container_width=True, height=520, hide_index=True)
+        st.dataframe(display, width="stretch", height=520, hide_index=True)
 
         st.markdown("**Seleccionar yacimiento para ver detalle:**")
         yac_options = fields["areayacimiento"].tolist()
@@ -1076,7 +1861,7 @@ def screen_fields() -> None:
                 lambda v: f"{int(v):,}" if pd.notna(v) else "—"
             )
             leader_disp.index = range(1, len(leader_disp) + 1)
-            st.dataframe(leader_disp, use_container_width=True, height=240)
+            st.dataframe(leader_disp, width="stretch", height=240)
 
         # Quick stats for this view
         st.markdown("---")
@@ -1085,7 +1870,7 @@ def screen_fields() -> None:
         st.metric("Pozos", f"{int(fields['wells'].sum()):,}")
         st.metric("Petróleo", fmt_m3(fields["cum_oil"].sum()))
         st.metric("BPD YTD (suma)", fmt_bpd(fields["bpd_ytd"].sum()))
-        st.metric("Gas (miles m³)", fmt_m3(fields["cum_gas"].sum()))
+        st.metric("Gas (MMm³)", f"{fields['cum_gas'].sum()/1000:,.2f}")
 
 
 # ---------------------------------------------------------------------------
@@ -1104,7 +1889,7 @@ def screen_field_detail() -> None:
 
     back_col, _ = st.columns([2, 10])
     with back_col:
-        if st.button("← Volver a yacimientos", use_container_width=True, key="back_field_detail"):
+        if st.button("← Volver a yacimientos", width="stretch", key="back_field_detail"):
             navigate("fields")
             st.rerun()
 
@@ -1150,7 +1935,7 @@ def screen_field_detail() -> None:
         own_df, x="Stake", y=["Participación"] * len(own_df),
         color="Operador", orientation="h",
         text=own_df["Stake"].apply(lambda v: f"{v:.1f}%"),
-        color_discrete_sequence=px.colors.qualitative.Set2,
+        color_discrete_sequence=EARTH_PALETTE,
     )
     fig_own.update_layout(
         height=90, margin=dict(l=0, r=0, t=5, b=0),
@@ -1158,7 +1943,7 @@ def screen_field_detail() -> None:
         yaxis=dict(title=None),
         legend=dict(orientation="h", yanchor="bottom", y=1.05),
     )
-    st.plotly_chart(fig_own, use_container_width=True)
+    st.plotly_chart(fig_own, width="stretch")
 
     # ---------- Build consolidated monthly series ----------
     monthly = ts.sort_values("fecha").reset_index(drop=True).copy()
@@ -1221,11 +2006,22 @@ def screen_field_detail() -> None:
                  help="Barriles por día efectivo (TEF).")
     r1[3].metric("BPD por pozo (últ. mes)", fmt_bpd(bpd_per_well_last))
 
+    cum_oil_bbl = cum_oil * M3_TO_BBL
+    cum_gas_MMm3 = cum_gas / 1000.0  # prod_gas viene en miles m³ → MMm³
+
     r2 = st.columns(4)
-    r2[0].metric(f"Petróleo {year} (YTD)", fmt_m3(cum_oil))
-    r2[1].metric(f"BPD {year} (YTD)", fmt_bpd(bpd_ytd))
-    r2[2].metric(f"BPD {year} on-time (YTD)", fmt_bpd(bpd_ytd_ontime))
-    r2[3].metric("Pozos (máx concurrente)", f"{int(monthly['wells'].max() or 0)}")
+    r2[0].metric(
+        f"Petróleo {year} (YTD)",
+        fmt_m3(cum_oil),
+        help=f"{cum_oil_bbl:,.0f} bbl ({cum_oil_bbl/1000:,.0f} k bbl)",
+    )
+    r2[1].metric(f"Petróleo {year} (bbl)", f"{cum_oil_bbl/1000:,.0f} k bbl")
+    r2[2].metric(
+        f"Gas {year} (MMm³)",
+        f"{cum_gas_MMm3:,.2f}",
+        help=f"{cum_gas:,.0f} miles m³ · {cum_gas*1000:,.0f} m³",
+    )
+    r2[3].metric(f"BPD {year} (YTD)", fmt_bpd(bpd_ytd))
 
     r3 = st.columns(4)
     r3[0].metric(
@@ -1237,14 +2033,36 @@ def screen_field_detail() -> None:
     r3[2].metric("Eficiencia (últ. vs pico)", f"{efficiency:.1f}%")
     r3[3].metric("Decline rate (mensual)", f"{D*100:.1f}%")
 
+    # First-production date (across all published years)
+    first_prod = get_field_first_production(operator, yacimiento)
+    if first_prod is not None:
+        fp_year, fp_month = first_prod
+        fp_label = f"{MESES_ES[fp_month-1]} {fp_year}" if 1 <= fp_month <= 12 else f"{fp_year}"
+        fp_help = (
+            f"Primer mes con producción publicada para este yacimiento×operador "
+            f"(historia Secretaría desde {min(RESOURCES_BY_YEAR)})."
+        )
+    else:
+        fp_label = "—"
+        fp_help = "Sin registros en la serie publicada."
+
     r4 = st.columns(4)
-    r4[0].metric("Gas acumulado (YTD)", f"{cum_gas:,.0f} miles m³")
-    r4[1].metric("Water cut", f"{water_cut:.1f}%")
-    r4[2].metric("GOR (m³/m³)", f"{gor:,.0f}")
+    r4[0].metric("Inicio de producción", fp_label, help=fp_help)
+    r4[1].metric("Pozos (máx concurrente)", f"{int(monthly['wells'].max() or 0)}")
+    r4[2].metric(f"BPD {year} on-time (YTD)", fmt_bpd(bpd_ytd_ontime))
     r4[3].metric("Meses con datos", f"{months_active}")
 
+    r5 = st.columns(3)
+    r5[0].metric("Water cut", f"{water_cut:.1f}%")
+    r5[1].metric("GOR (m³/m³)", f"{gor:,.0f}")
+    r5[2].metric(
+        "Gas YTD (MMm³)",
+        f"{cum_gas_MMm3:,.2f}",
+        help=f"{cum_gas:,.0f} miles m³ · {cum_gas*1000:,.0f} m³",
+    )
+
     if months_active < 6:
-        st.warning("⚠️ Menos de 6 meses de datos consolidados — modelo predictivo no confiable.")
+        st.warning("Menos de 6 meses de datos consolidados — modelo predictivo no confiable.")
 
     # ---------- Curve + DCA ----------
     st.subheader("Curva consolidada & proyección (DCA)")
@@ -1261,30 +2079,44 @@ def screen_field_detail() -> None:
                 "Precio crudo (USD/bbl)", value=70.0, min_value=1.0, step=5.0
             )
 
+    # Precompute mode-independent metrics so every hover shows the full picture
+    dim = monthly["days_in_month"].replace(0, np.nan).fillna(30.44)
+    monthly["_bpd"] = monthly["oil"] * M3_TO_BBL / dim
+    monthly["_bbl"] = monthly["oil"] * M3_TO_BBL
+
     if mode == "Ingresos (USD)":
-        monthly["value"] = monthly["oil"] * M3_TO_BBL * price
+        monthly["value"] = monthly["_bbl"] * price
         y_label = "Ingresos mensuales (USD)"
+        primary_line = "Ingresos: $%{y:,.0f}<br>"
     elif mode == "BPD (calendario)":
-        dim = monthly["days_in_month"].replace(0, np.nan).fillna(30.44)
-        monthly["value"] = monthly["oil"] * M3_TO_BBL / dim
+        monthly["value"] = monthly["_bpd"]
         y_label = "BPD (barriles / día calendario)"
+        primary_line = "BPD: %{y:,.0f} bbl/d<br>"
     else:
         monthly["value"] = monthly["oil"]
         y_label = "Petróleo (m³/mes)"
+        primary_line = "Petróleo: %{y:,.0f} m³<br>"
 
     with c1:
         fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=monthly["fecha"], y=monthly["value"],
             mode="lines+markers", name="Producción consolidada",
-            line=dict(color="#2563eb", width=2.5),
+            line=dict(color="#5C3D2E", width=2.5),
             marker=dict(size=5),
-            customdata=np.stack([monthly["wells"], monthly["oil"]], axis=-1),
+            customdata=np.stack([
+                monthly["wells"], monthly["oil"], monthly["_bbl"],
+                monthly["_bpd"], monthly["gas"] / 1000.0,
+            ], axis=-1),
             hovertemplate=(
                 "<b>%{x|%Y-%m}</b><br>"
-                "Valor: %{y:,.1f}<br>"
-                "Pozos activos: %{customdata[0]:.0f}<br>"
-                "Petróleo: %{customdata[1]:,.0f} m³<extra></extra>"
+                + primary_line
+                + "Pozos activos: %{customdata[0]:.0f}<br>"
+                + "Petróleo: %{customdata[1]:,.0f} m³ "
+                + "(%{customdata[2]:,.0f} bbl)<br>"
+                + "BPD (calendario): %{customdata[3]:,.0f}<br>"
+                + "Gas: %{customdata[4]:,.2f} MMm³"
+                + "<extra></extra>"
             ),
         ))
 
@@ -1309,14 +2141,14 @@ def screen_field_detail() -> None:
                     fvals = forecast_oil
                 fig.add_trace(go.Scatter(
                     x=dates, y=fvals, mode="lines", name="Proyección DCA",
-                    line=dict(color="#f97316", width=2, dash="dash"),
+                    line=dict(color="#B8663A", width=2, dash="dash"),
                 ))
                 eur = cum_oil + sum(forecast_oil)
                 fig.add_annotation(
                     x=dates[len(dates) // 2], y=max(fvals) * 0.8 if fvals else 0,
                     text=f"<b>EUR: {eur:,.0f} m³ ({eur*M3_TO_BBL/1000:,.0f} k bbl)</b>",
-                    showarrow=True, arrowhead=2, bgcolor="#fff", bordercolor="#f97316",
-                    font=dict(size=12, color="#c2410c"),
+                    showarrow=True, arrowhead=2, bgcolor="#FAF6F1", bordercolor="#B8663A",
+                    font=dict(size=12, color="#5C3D2E"),
                 )
 
         fig.update_layout(
@@ -1325,62 +2157,154 @@ def screen_field_detail() -> None:
             legend=dict(orientation="h", yanchor="bottom", y=1.02),
             hovermode="x unified",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     # ---------- Active-well count evolution ----------
     st.subheader("Pozos activos por mes")
     fig_w = go.Figure()
     fig_w.add_trace(go.Bar(
         x=monthly["fecha"], y=monthly["wells"],
-        marker_color="#0ea5e9", name="Pozos activos",
+        marker_color="#B8A89A", name="Pozos activos",
         hovertemplate="%{x|%Y-%m}<br>%{y:.0f} pozos<extra></extra>",
     ))
     fig_w.update_layout(
         height=220, margin=dict(l=40, r=20, t=10, b=40),
         xaxis_title="Fecha", yaxis_title="Nº pozos",
     )
-    st.plotly_chart(fig_w, use_container_width=True)
+    st.plotly_chart(fig_w, width="stretch")
 
     # ---------- Basin benchmarking (yacimiento vs yacimiento) ----------
     st.subheader("Benchmark de cuenca (yacimientos)")
     if basin:
         with st.spinner("Calculando percentiles de la cuenca..."):
             basin_fields = get_basin_field_totals(basin, year)
-        # Aggregate basin rollup to yacimiento-level (sum across operators)
+        # Aggregate basin rollup to yacimiento-level (sum across operators, keeping
+        # the most recent month across JV partners for last-month metrics)
         if not basin_fields.empty:
             basin_fields = (
                 basin_fields.groupby("areayacimiento", as_index=False)
-                .agg(cum_oil=("cum_oil", "sum"), wells=("wells", "sum"))
+                .agg(
+                    cum_oil=("cum_oil", "sum"),
+                    wells=("wells", "sum"),
+                    n_months=("n_months", "max"),
+                    oil_last=("oil_last", "sum"),
+                    last_days=("last_days", "max"),
+                )
             )
         if basin_fields.empty or len(basin_fields) < 5:
             st.info("Cuenca con pocos yacimientos; no se calculan percentiles.")
         else:
-            p10 = basin_fields["cum_oil"].quantile(0.10)
-            p50 = basin_fields["cum_oil"].quantile(0.50)
-            p90 = basin_fields["cum_oil"].quantile(0.90)
+            # Filter out yacimientos with zero production before computing percentiles
+            # (muchos campos en la base tienen 0 este año — meten ruido a la mediana)
+            active = basin_fields[basin_fields["cum_oil"] > 0]
+            if len(active) >= 5:
+                p10 = active["cum_oil"].quantile(0.10)
+                p50 = active["cum_oil"].quantile(0.50)
+                p90 = active["cum_oil"].quantile(0.90)
+            else:
+                p10 = p50 = p90 = 0.0
+
+            # Top-N yacimientos of the basin, with the selected one forced in
+            TOP_N = 15
+            top_df = basin_fields.sort_values("cum_oil", ascending=False).head(TOP_N).copy()
+            if yacimiento not in set(top_df["areayacimiento"]):
+                sel_row = basin_fields[basin_fields["areayacimiento"] == yacimiento]
+                if not sel_row.empty:
+                    top_df = pd.concat([top_df, sel_row], ignore_index=True)
+            top_df = top_df.sort_values("cum_oil", ascending=True).reset_index(drop=True)
+            top_df["bbl"] = top_df["cum_oil"] * M3_TO_BBL
+            # BPD YTD por yacimiento: bbl acumulados / días con datos reportados
+            # (usamos n_months*30.44 por yacimiento para ser fiel a su propia ventana)
+            top_df["ytd_days"] = top_df["n_months"].fillna(0) * 30.44
+            top_df["bpd_ytd"] = np.where(
+                top_df["ytd_days"] > 0,
+                top_df["bbl"] / top_df["ytd_days"],
+                0.0,
+            )
+            # BPD último mes: bbl del último mes / días de ese mes
+            top_df["last_bbl"] = top_df["oil_last"].fillna(0) * M3_TO_BBL
+            top_df["bpd_last"] = np.where(
+                top_df["last_days"].fillna(0) > 0,
+                top_df["last_bbl"] / top_df["last_days"].replace(0, 30.44),
+                0.0,
+            )
+            # Tendencia: último mes vs promedio YTD (>1 = subiendo)
+            top_df["trend"] = np.where(
+                top_df["bpd_ytd"] > 0,
+                top_df["bpd_last"] / top_df["bpd_ytd"],
+                0.0,
+            )
+
+            colors = [
+                "#B8663A" if name == yacimiento else "#B8A89A"
+                for name in top_df["areayacimiento"]
+            ]
             bench = go.Figure()
+            # Arrow ↑ si último mes > YTD, ↓ si viene bajando, = estable
+            def _arrow(r):
+                if r <= 0:
+                    return ""
+                if r > 1.05:
+                    return "↑"
+                if r < 0.95:
+                    return "↓"
+                return "="
             bench.add_trace(go.Bar(
-                y=[yacimiento], x=[cum_oil], orientation="h",
-                marker_color="#2563eb", name=yacimiento,
-                text=[f"{cum_oil:,.0f} m³ ({cum_oil*M3_TO_BBL/1000:,.0f} k bbl)"],
-                textposition="auto",
+                y=top_df["areayacimiento"],
+                x=top_df["bbl"] / 1000,   # k bbl
+                orientation="h",
+                marker_color=colors,
+                customdata=np.stack([
+                    top_df["cum_oil"],
+                    top_df["wells"],
+                    top_df["bpd_ytd"],
+                    top_df["bpd_last"],
+                    top_df["trend"],
+                ], axis=-1),
+                hovertemplate=(
+                    "<b>%{y}</b><br>"
+                    "Petróleo YTD: %{x:,.0f} k bbl (%{customdata[0]:,.0f} m³)<br>"
+                    "BPD YTD: %{customdata[2]:,.0f} bbl/d<br>"
+                    "BPD último mes: %{customdata[3]:,.0f} bbl/d<br>"
+                    "Tendencia (últ/YTD): %{customdata[4]:.2f}x<br>"
+                    "Pozos: %{customdata[1]:.0f}<extra></extra>"
+                ),
+                text=[
+                    f"{b/1000:,.0f} kbbl · YTD {ytd:,.0f} · últ {last:,.0f} bbl/d {_arrow(tr)}"
+                    for b, ytd, last, tr in zip(
+                        top_df["bbl"], top_df["bpd_ytd"],
+                        top_df["bpd_last"], top_df["trend"],
+                    )
+                ],
+                textposition="outside",
+                cliponaxis=False,
             ))
-            for label, val, color in [
-                ("P10", p10, "#dc2626"),
-                ("P50 (mediana)", p50, "#ea580c"),
-                ("P90", p90, "#16a34a"),
-            ]:
+            # Mediana de la cuenca como referencia (solo si hay suficientes activos)
+            p50_bbl = p50 * M3_TO_BBL / 1000
+            if p50 > 0:
                 bench.add_vline(
-                    x=val, line_dash="dash", line_color=color,
-                    annotation_text=f"{label}: {val:,.0f}",
-                    annotation_position="top",
+                    x=p50_bbl, line_dash="dash", line_color="#5C3D2E",
+                    annotation_text=f"Mediana cuenca: {p50_bbl:,.0f} k bbl",
+                    annotation_position="top right",
+                    annotation_font_color="#5C3D2E",
                 )
             bench.update_layout(
-                height=180, margin=dict(l=0, r=20, t=40, b=20),
-                xaxis_title=f"Petróleo acumulado {year} (m³)",
+                height=max(320, 28 * len(top_df) + 80),
+                margin=dict(l=0, r=100, t=40, b=40),
+                xaxis_title=f"Petróleo acumulado {year} (k bbl)",
+                yaxis_title=None,
                 showlegend=False,
             )
-            st.plotly_chart(bench, use_container_width=True)
+            st.caption(
+                f"Top {TOP_N} yacimientos activos de {basin} — eje: petróleo YTD (k bbl). "
+                f"Cada barra: **YTD** (promedio año) · **últ** (BPD último mes) · "
+                f"↑ = último mes > YTD (subiendo), ↓ = bajando, = estable. "
+                f"Percentiles sobre {len(active):,} yacimientos activos: "
+                f"P10 {p10*M3_TO_BBL/1000:,.0f} · "
+                f"P50 {p50*M3_TO_BBL/1000:,.0f} · "
+                f"P90 {p90*M3_TO_BBL/1000:,.0f} k bbl."
+            )
+            st.plotly_chart(bench, width="stretch")
 
             basin_sorted = basin_fields.sort_values("cum_oil", ascending=False).reset_index(drop=True)
             basin_sorted.index = basin_sorted.index + 1
@@ -1396,14 +2320,29 @@ def screen_field_detail() -> None:
                 lo = max(1, rank_pos - 5)
                 hi = min(len(basin_sorted), rank_pos + 5)
                 neighbors = basin_sorted.loc[lo:hi].copy()
+                neighbors["bbl"] = neighbors["cum_oil"] * M3_TO_BBL
+                neighbors["ytd_days"] = neighbors["n_months"].fillna(0) * 30.44
+                neighbors["bpd_ytd"] = np.where(
+                    neighbors["ytd_days"] > 0,
+                    neighbors["bbl"] / neighbors["ytd_days"], 0.0,
+                )
+                neighbors["bpd_last"] = np.where(
+                    neighbors["last_days"].fillna(0) > 0,
+                    neighbors["oil_last"].fillna(0) * M3_TO_BBL
+                    / neighbors["last_days"].replace(0, 30.44),
+                    0.0,
+                )
+                neighbors["k bbl YTD"] = (neighbors["bbl"] / 1000).round(0)
                 neighbors_disp = neighbors.rename(columns={
                     "areayacimiento": "Yacimiento",
                     "wells": "Pozos",
-                    "cum_oil": "Petróleo (m³)",
-                })[["Yacimiento", "Pozos", "Petróleo (m³)"]]
-                neighbors_disp["Petróleo (m³)"] = neighbors_disp["Petróleo (m³)"].apply(
-                    lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
-                )
+                    "bpd_ytd": "BPD YTD",
+                    "bpd_last": "BPD últ. mes",
+                })[["Yacimiento", "Pozos", "k bbl YTD", "BPD YTD", "BPD últ. mes"]]
+                for c in ["k bbl YTD", "BPD YTD", "BPD últ. mes"]:
+                    neighbors_disp[c] = neighbors_disp[c].apply(
+                        lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
+                    )
                 neighbors_disp["Pozos"] = neighbors_disp["Pozos"].apply(
                     lambda v: f"{int(v):,}" if pd.notna(v) else "—"
                 )
@@ -1416,12 +2355,12 @@ def screen_field_detail() -> None:
 
                 st.dataframe(
                     neighbors_disp.style.apply(_row_style, axis=1),
-                    use_container_width=True,
+                    width="stretch",
                     height=min(40 + 35 * len(neighbors_disp), 450),
                 )
 
     # ---------- Drill-down: individual wells ----------
-    with st.expander(f"🔎 Pozos individuales ({n_wells_total})", expanded=False):
+    with st.expander(f"Pozos individuales ({n_wells_total})", expanded=False):
         if wells_df.empty:
             st.info("Sin datos de pozos para este yacimiento en el año seleccionado.")
         else:
@@ -1434,21 +2373,24 @@ def screen_field_detail() -> None:
                 "formacion": "Formación",
                 "tipo_de_recurso": "Tipo",
                 "cum_oil": "Petróleo (m³)",
-                "cum_gas": "Gas (miles m³)",
+                "cum_gas": "Gas (MMm³)",
                 "peak_oil": "Pico mes (m³)",
                 "months": "Meses",
                 "bpd_ytd": "BPD YTD",
             })[["#", "Pozo", "Formación", "Tipo", "Petróleo (m³)",
-                 "BPD YTD", "Gas (miles m³)", "Pico mes (m³)", "Meses"]]
-            for c in ["Petróleo (m³)", "Gas (miles m³)", "Pico mes (m³)"]:
+                 "BPD YTD", "Gas (MMm³)", "Pico mes (m³)", "Meses"]]
+            for c in ["Petróleo (m³)", "Pico mes (m³)"]:
                 w_disp[c] = w_disp[c].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+            w_disp["Gas (MMm³)"] = w_disp["Gas (MMm³)"].apply(
+                lambda v: f"{v/1000:,.2f}" if pd.notna(v) else "—"
+            )
             w_disp["BPD YTD"] = w_disp["BPD YTD"].apply(
                 lambda v: f"{v:,.0f}" if pd.notna(v) else "—"
             )
             w_disp["Meses"] = w_disp["Meses"].apply(
                 lambda v: f"{int(v):,}" if pd.notna(v) else "—"
             )
-            st.dataframe(w_disp, use_container_width=True, hide_index=True, height=360)
+            st.dataframe(w_disp, width="stretch", hide_index=True, height=360)
 
     # ---------- Export ----------
     st.subheader("Exportar")
@@ -1468,7 +2410,7 @@ def screen_field_detail() -> None:
     csv_bytes = export.to_csv(index=False).encode("utf-8")
     safe_name = str(yacimiento).replace("/", "_").replace(" ", "_")
     st.download_button(
-        "📥 Descargar reporte del yacimiento (CSV)",
+        "Descargar reporte del yacimiento (CSV)",
         data=csv_bytes,
         file_name=f"{safe_name}_{year}_report.csv",
         mime="text/csv",

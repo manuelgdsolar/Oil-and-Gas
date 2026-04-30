@@ -216,17 +216,21 @@ API_SQL = f"{API_BASE}/datastore_search_sql"
 # "Producción de Pozos de Gas y Petróleo" — yearly resources (all well types).
 # Source: https://datos.energia.gob.ar/dataset/produccin-de-pozos-de-gas-y-petrleo-por-pozo
 RESOURCES_BY_YEAR = {
-    2026: "fb7a47a0-cba9-4667-a004-6f6c1c346c23",
-    2025: "d774b5d7-0756-48fe-88f2-8729b57b22da",
-    2024: "43a09dce-1742-44d0-bc13-f193deaab563",
-    2023: "231c39b3-e81e-4398-af8d-b115807f2c25",
-    2022: "876b3746-85e2-4039-adeb-b1354436159f",
-    2021: "465be754-a372-4c31-b855-81dc5fe3309f",
-    2020: "c4a4a6a0-e75a-4e12-ae5c-54d53a70348c",
-    2019: "8bc0d61c-0408-43d4-a7bc-7178fcb5d37e",
-    2018: "333fd72a-9b83-4bc1-bc94-0f5940b52331",
-    # 2015-2017 quedan fuera por ahora: el portal no expone resource_id bulk
-    # para esos años. Para sumarlos, agregá su UUID acá cuando lo consigas.
+    # Familia "DDJJ abiertas y cerradas" — los recursos viejos (sin "DDJJ"
+    # en el nombre) fueron deprecados y devuelven 404 en datastore_search.
+    # Estos son los activos y mantenidos por la Secretaría.
+    2026: "85d6e021-a00d-4997-b74e-0b9b43c547fe",
+    2025: "561279bf-1b7c-4fb1-9d39-9f3fb27ab237",
+    2024: "0a352dee-8b4e-4e95-b01e-5b8082ce22ac",
+    2023: "4b31fa79-dc2d-4228-a6ac-7e804cb36d1d",
+    2022: "ae8d5a47-5181-4add-a836-ac19fb104fe1",
+    2021: "cc966108-e577-4043-b553-81173ef83816",
+    2020: "508ce39a-00d0-4164-a997-7ad25dda1c1a",
+    2019: "d7dd85a5-4268-43b3-9ce5-c713cbbec2dc",
+    2018: "13e30415-a2ac-46fe-a8ff-9810d8323ac9",
+    2017: "97c81dbc-9db4-4a61-8e78-ee0a934fa620",
+    2016: "8a7f0dff-5a1d-4b1e-a8df-e566a85c3c69",
+    2015: "36c4ca2b-8f9f-4bed-8ceb-ed9c8647f861",
 }
 # "Capítulo IV — Pozos" (padrón de pozos — well metadata, drilling info, coords)
 PADRON_RESOURCE = "cb5c0f04-7835-45cd-b982-3e25ca7d7751"

@@ -1023,6 +1023,128 @@ def get_basin_operator_leaderboard(basin: str | None, year: int, top: int = 5) -
 
 
 # ---------------------------------------------------------------------------
+# Due diligence helpers — análisis a nivel "área" (yacimiento × operador)
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_area_well_status_breakdown(operator: str, yacimiento: str, year: int) -> dict:
+    """Clasifica cada pozo del área por estado en el año seleccionado.
+
+    - Activo: produjo > 0 m³ de petróleo en el último mes con datos
+    - Inactivo: tuvo producción acumulada > 0 en el año pero 0 en últ. mes
+    - Marginal: activo pero promedio últ. 3 meses < 50% del pico anual
+    """
+    df = year_df(year)
+    if df is None or df.empty:
+        return {"activos": 0, "marginales": 0, "inactivos": 0, "total": 0}
+    sub = df[
+        (df["empresa"].fillna("").str.strip() == str(operator).strip())
+        & (df["areayacimiento"].fillna("").str.strip() == str(yacimiento).strip())
+    ]
+    if sub.empty:
+        return {"activos": 0, "marginales": 0, "inactivos": 0, "total": 0}
+
+    last_ym = int(sub["yyyymm"].max())
+    monthly = (
+        sub.groupby(["idpozo", "yyyymm"], dropna=False)["prod_pet"]
+        .sum()
+        .reset_index()
+    )
+    activos, marginales, inactivos = 0, 0, 0
+    for pid, g in monthly.groupby("idpozo"):
+        g = g.sort_values("yyyymm")
+        cum = g["prod_pet"].sum()
+        if cum <= 0:
+            continue
+        last = g[g["yyyymm"] == last_ym]["prod_pet"].sum()
+        if last <= 0:
+            inactivos += 1
+            continue
+        peak = g["prod_pet"].max()
+        last3 = g.tail(3)["prod_pet"].mean()
+        if peak > 0 and last3 < peak * 0.5:
+            marginales += 1
+        else:
+            activos += 1
+
+    total = activos + marginales + inactivos
+    return {"activos": activos, "marginales": marginales,
+            "inactivos": inactivos, "total": total}
+
+
+@st.cache_data(ttl=3600 * 6, show_spinner=False)
+def get_area_drilling_history(operator: str, yacimiento: str) -> pd.DataFrame:
+    """Cuenta pozos nuevos por año (basado en su primer mes de producción).
+
+    Recorre todos los años cacheados en disco y, para cada pozo del área,
+    determina el año en que aparece por primera vez con prod_pet o prod_gas > 0.
+    Devuelve DataFrame [anio, pozos_nuevos].
+    """
+    op = str(operator).strip()
+    yac = str(yacimiento).strip()
+    first_ym_per_well: dict[str, int] = {}
+
+    for y in sorted(RESOURCES_BY_YEAR.keys()):
+        if not _year_cache_path(y).exists():
+            continue
+        df = year_df(y)
+        if df is None or df.empty:
+            continue
+        sub = df[
+            (df["empresa"].fillna("").str.strip() == op)
+            & (df["areayacimiento"].fillna("").str.strip() == yac)
+            & ((df["prod_pet"].fillna(0) > 0) | (df["prod_gas"].fillna(0) > 0))
+        ]
+        if sub.empty:
+            continue
+        first_in_year = sub.groupby("idpozo")["yyyymm"].min()
+        for pid, ym in first_in_year.items():
+            if pid not in first_ym_per_well or int(ym) < first_ym_per_well[pid]:
+                first_ym_per_well[pid] = int(ym)
+
+    if not first_ym_per_well:
+        return pd.DataFrame(columns=["anio", "pozos_nuevos"])
+
+    years = [ym // 100 for ym in first_ym_per_well.values()]
+    out = (
+        pd.Series(years).value_counts().sort_index()
+        .rename_axis("anio").reset_index(name="pozos_nuevos")
+    )
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_area_peers(yacimiento: str, basin: str, tipo_recurso: str,
+                   year: int, top: int = 5) -> pd.DataFrame:
+    """Devuelve los top yacimientos peers (misma cuenca + tipo) por petróleo YTD.
+
+    Excluye el yacimiento de referencia. Útil para benchmark de M&A.
+    """
+    df = year_df(year)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = _filter_valid_yac(df)
+    m = df["cuenca"].fillna("").str.strip() == str(basin).strip()
+    if tipo_recurso:
+        m &= df["tipo_de_recurso"].fillna("").str.strip() == str(tipo_recurso).strip()
+    sub = df[m & (df["areayacimiento"].fillna("").str.strip() != str(yacimiento).strip())]
+    if sub.empty:
+        return pd.DataFrame()
+    out = (
+        sub.groupby(["areayacimiento", "empresa"], dropna=False)
+        .agg(
+            cum_oil=("prod_pet", "sum"),
+            cum_gas=("prod_gas", "sum"),
+            wells=("idpozo", "nunique"),
+        )
+        .reset_index()
+        .sort_values("cum_oil", ascending=False, na_position="last")
+        .head(int(top))
+        .reset_index(drop=True)
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Computation helpers
 # ---------------------------------------------------------------------------
 def quality_pill(val: float, p33: float, p66: float) -> str:
@@ -1878,10 +2000,9 @@ def screen_field_detail() -> None:
         f"{last_oil_m3:,.0f} m³",
         help=f"{last_date.strftime('%Y-%m') if pd.notna(last_date) else '—'} · {last_wells} pozos activos",
     )
-    r1[1].metric("BPD último mes (calendario)", fmt_bpd(bpd_last))
-    r1[2].metric("BPD último mes (on-time)", fmt_bpd(bpd_last_ontime),
-                 help="Barriles por día efectivo (TEF).")
-    r1[3].metric("BPD por pozo (últ. mes)", fmt_bpd(bpd_per_well_last))
+    r1[1].metric("BPD último mes", fmt_bpd(bpd_last))
+    r1[2].metric("BPD por pozo (últ. mes)", fmt_bpd(bpd_per_well_last))
+    r1[3].metric("Decline rate (mensual)", f"{D*100:.1f}%")
 
     cum_oil_bbl = cum_oil * M3_TO_BBL
     cum_gas_MMm3 = cum_gas / 1000.0  # prod_gas viene en miles m³ → MMm³
@@ -1908,7 +2029,7 @@ def screen_field_detail() -> None:
     )
     r3[1].metric("BPD pico", fmt_bpd(bpd_peak))
     r3[2].metric("Eficiencia (últ. vs pico)", f"{efficiency:.1f}%")
-    r3[3].metric("Decline rate (mensual)", f"{D*100:.1f}%")
+    r3[3].metric("Water cut", f"{water_cut:.1f}%")
 
     # First-production date (across all published years)
     first_prod = get_field_first_production(operator, yacimiento)
@@ -1926,17 +2047,8 @@ def screen_field_detail() -> None:
     r4 = st.columns(4)
     r4[0].metric("Inicio de producción", fp_label, help=fp_help)
     r4[1].metric("Pozos (máx concurrente)", f"{int(monthly['wells'].max() or 0)}")
-    r4[2].metric(f"BPD {year} on-time (YTD)", fmt_bpd(bpd_ytd_ontime))
+    r4[2].metric("GOR (m³/m³)", f"{gor:,.0f}")
     r4[3].metric("Meses con datos", f"{months_active}")
-
-    r5 = st.columns(3)
-    r5[0].metric("Water cut", f"{water_cut:.1f}%")
-    r5[1].metric("GOR (m³/m³)", f"{gor:,.0f}")
-    r5[2].metric(
-        "Gas YTD (MMm³)",
-        f"{cum_gas_MMm3:,.2f}",
-        help=f"{cum_gas:,.0f} miles m³ · {cum_gas*1000:,.0f} m³",
-    )
 
     if months_active < 6:
         st.warning("Menos de 6 meses de datos consolidados — modelo predictivo no confiable.")
@@ -2268,6 +2380,238 @@ def screen_field_detail() -> None:
                 lambda v: f"{int(v):,}" if pd.notna(v) else "—"
             )
             st.dataframe(w_disp, width="stretch", hide_index=True, height=360)
+
+    # ---------- Análisis de área (Due Diligence M&A) ----------
+    st.markdown("---")
+    st.subheader("Análisis de área · Due Diligence")
+    st.caption(
+        "Métricas pensadas para evaluar el área como activo independiente "
+        "del operador actual. Útil para screening de M&A."
+    )
+
+    # ----- Distribución P10 / P50 / P90 -----
+    if not wells_df.empty and "cum_oil" in wells_df.columns:
+        cum_series = wells_df["cum_oil"].dropna()
+        cum_series = cum_series[cum_series > 0]
+        if len(cum_series) >= 3:
+            p10 = float(cum_series.quantile(0.90))  # P10 = top 10% (mejores)
+            p50 = float(cum_series.quantile(0.50))
+            p90 = float(cum_series.quantile(0.10))  # P90 = top 90% (peores)
+            mean_well = float(cum_series.mean())
+
+            st.markdown("**Distribución de calidad de pozos (petróleo YTD)**")
+            _days_cov = max(months_active * 30.44, 1.0) if months_active else 30.44
+            def _to_bpd(m3: float) -> float:
+                return float(m3) * M3_TO_BBL / _days_cov
+
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("P10 (mejor 10%)", f"{p10:,.0f} m³",
+                      delta=f"{_to_bpd(p10):,.0f} bpd", delta_color="off",
+                      help="El 10% de los pozos producen más que esto.")
+            d2.metric("P50 (mediana)", f"{p50:,.0f} m³",
+                      delta=f"{_to_bpd(p50):,.0f} bpd", delta_color="off",
+                      help="La mitad de los pozos producen más que esto.")
+            d3.metric("P90 (peor 10%)", f"{p90:,.0f} m³",
+                      delta=f"{_to_bpd(p90):,.0f} bpd", delta_color="off",
+                      help="El 90% de los pozos producen más que esto.")
+            d4.metric("Promedio por pozo", f"{mean_well:,.0f} m³",
+                      delta=f"{_to_bpd(mean_well):,.0f} bpd", delta_color="off")
+
+            ratio = p10 / p90 if p90 > 0 else 0
+            if ratio > 0:
+                st.caption(
+                    f"Ratio P10/P90 = **{ratio:,.1f}x** — "
+                    + ("alta heterogeneidad (pocos pozos sostienen el área)."
+                       if ratio > 10 else
+                       "área homogénea (calidad pareja entre pozos)."
+                       if ratio < 3 else
+                       "heterogeneidad moderada.")
+                )
+
+            # --- Distribución de gas ---
+            if "cum_gas" in wells_df.columns:
+                gas_series = wells_df["cum_gas"].dropna()
+                gas_series = gas_series[gas_series > 0]
+                if len(gas_series) >= 3:
+                    g_p10 = float(gas_series.quantile(0.90))
+                    g_p50 = float(gas_series.quantile(0.50))
+                    g_p90 = float(gas_series.quantile(0.10))
+                    g_mean = float(gas_series.mean())
+
+                    def _gas_mmm3(v_km3: float) -> str:
+                        return f"{v_km3/1000.0:,.2f} MMm³"
+                    def _gas_daily(v_km3: float) -> str:
+                        return f"{v_km3/_days_cov:,.1f} k m³/d"
+
+                    st.markdown("**Distribución de calidad de pozos (gas YTD)**")
+                    g1, g2, g3, g4 = st.columns(4)
+                    g1.metric("P10 (mejor 10%)", _gas_mmm3(g_p10),
+                              delta=_gas_daily(g_p10), delta_color="off",
+                              help="El 10% de los pozos producen más gas que esto.")
+                    g2.metric("P50 (mediana)", _gas_mmm3(g_p50),
+                              delta=_gas_daily(g_p50), delta_color="off",
+                              help="La mitad de los pozos producen más gas que esto.")
+                    g3.metric("P90 (peor 10%)", _gas_mmm3(g_p90),
+                              delta=_gas_daily(g_p90), delta_color="off",
+                              help="El 90% de los pozos producen más gas que esto.")
+                    g4.metric("Promedio por pozo", _gas_mmm3(g_mean),
+                              delta=_gas_daily(g_mean), delta_color="off")
+
+                    g_ratio = g_p10 / g_p90 if g_p90 > 0 else 0
+                    if g_ratio > 0:
+                        st.caption(
+                            f"Ratio P10/P90 (gas) = **{g_ratio:,.1f}x** — "
+                            + ("alta heterogeneidad."
+                               if g_ratio > 10 else
+                               "área homogénea."
+                               if g_ratio < 3 else
+                               "heterogeneidad moderada.")
+                        )
+                else:
+                    st.caption("Sin datos suficientes de gas para calcular distribución.")
+        else:
+            st.caption("No hay suficientes pozos para calcular distribución P10/P50/P90.")
+
+    # ----- Estado de pozos -----
+    status_dd = get_area_well_status_breakdown(operator, yacimiento, year)
+    if status_dd["total"] > 0:
+        st.markdown("**Estado operativo de los pozos**")
+        s1, s2, s3, s4 = st.columns(4)
+        pct = lambda n: (100.0 * n / status_dd["total"]) if status_dd["total"] else 0
+        s1.metric("Activos", f"{status_dd['activos']}",
+                  delta=f"{pct(status_dd['activos']):.0f}% del total",
+                  delta_color="off")
+        s2.metric("Marginales", f"{status_dd['marginales']}",
+                  delta=f"{pct(status_dd['marginales']):.0f}% del total",
+                  delta_color="off",
+                  help="Activos pero produciendo <50% de su pico anual — "
+                       "candidatos a workover.")
+        s3.metric("Inactivos", f"{status_dd['inactivos']}",
+                  delta=f"{pct(status_dd['inactivos']):.0f}% del total",
+                  delta_color="off",
+                  help="Tuvieron producción en el año pero 0 en el último mes.")
+        s4.metric("Total con producción", f"{status_dd['total']}")
+
+        if status_dd["inactivos"] + status_dd["marginales"] > status_dd["activos"]:
+            st.caption(
+                "Más pozos no-óptimos que activos plenos — "
+                "potencial upside vía workover si Pecom invierte en intervenciones."
+            )
+
+    # ----- Ritmo de perforación -----
+    drill = get_area_drilling_history(operator, yacimiento)
+    # Cuántos años hay cacheados — relevante porque en Streamlit Cloud el
+    # cache se reinicia con cada redeploy y el análisis depende del histórico.
+    _cached_years = sorted([y for y in RESOURCES_BY_YEAR.keys()
+                            if _year_cache_path(y).exists()])
+    _n_cached = len(_cached_years)
+    _min_cached = min(_cached_years) if _cached_years else None
+
+    if not drill.empty:
+        st.markdown("**Ritmo de perforación histórico (pozos nuevos por año)**")
+        drill_show = drill.tail(10).copy()
+        fig_drill = px.bar(
+            drill_show, x="anio", y="pozos_nuevos",
+            text="pozos_nuevos",
+            labels={"anio": "Año", "pozos_nuevos": "Pozos nuevos"},
+        )
+        fig_drill.update_traces(textposition="outside")
+        fig_drill.update_layout(height=260, margin=dict(l=10, r=10, t=20, b=10),
+                                showlegend=False)
+        st.plotly_chart(fig_drill, width="stretch")
+
+        last_yrs = drill[drill["anio"] >= year - 3]
+        recent_total = int(last_yrs["pozos_nuevos"].sum()) if not last_yrs.empty else 0
+        c_drill_a, c_drill_b = st.columns(2)
+        c_drill_a.metric(
+            f"Pozos perforados últ. 3 años (≥ {year - 2})",
+            f"{recent_total}",
+            help="Refleja qué tan activo está el operador desarrollando el área.",
+        )
+        if recent_total == 0:
+            c_drill_b.caption(
+                "Sin perforaciones recientes — el operador actual no "
+                "estuvo invirtiendo en desarrollo. Posible upside si Pecom "
+                "decide reactivar el plan de pozos."
+            )
+        elif recent_total >= 5:
+            c_drill_b.caption("Área en desarrollo activo.")
+        else:
+            c_drill_b.caption("Desarrollo bajo en años recientes.")
+
+        # Nota sobre la cobertura de datos
+        if _n_cached < 5:
+            st.info(
+                f"**Estás viendo {_n_cached} año(s) cargado(s) "
+                f"(desde {_min_cached}).** Para exprimir este análisis, "
+                f"descargá más años desde el sidebar → *Descargar otro año "
+                f"(histórico)*. Idealmente 5+ años para distinguir campañas "
+                f"de desarrollo de pozos puntuales."
+            )
+    else:
+        st.info(
+            f"**Sin historia suficiente para calcular el ritmo de perforación.** "
+            f"Tenés {_n_cached} año(s) cargado(s)"
+            + (f" (desde {_min_cached})" if _min_cached else "")
+            + ". Para habilitar este análisis, descargá al menos 3-5 años "
+            + "desde el sidebar → *Descargar otro año (histórico)*. "
+            + "Cuantos más años, mejor el análisis del desarrollo histórico del área."
+        )
+
+    # ----- Benchmark vs peers -----
+    if basin:
+        peers = get_area_peers(yacimiento, basin, tipo, year, top=5)
+        if not peers.empty:
+            st.markdown(
+                f"**Benchmark vs peers · Cuenca {str(basin).title()}"
+                + (f" · {tipo}" if tipo else "")
+                + "**"
+            )
+            self_row = pd.DataFrame([{
+                "areayacimiento": yacimiento,
+                "empresa": operator,
+                "cum_oil": cum_oil,
+                "cum_gas": cum_gas,
+                "wells": int(wells_df["idpozo"].nunique()) if not wells_df.empty else 0,
+            }])
+            bench = pd.concat([self_row, peers], ignore_index=True)
+            bench = bench.sort_values("cum_oil", ascending=False, na_position="last").reset_index(drop=True)
+            bench.insert(0, "#", range(1, len(bench) + 1))
+            bench["BPD YTD"] = bench.apply(
+                lambda r: (r["cum_oil"] * M3_TO_BBL) /
+                          max(months_active * 30.44, 1) if months_active else 0,
+                axis=1,
+            )
+            bench_disp = bench.rename(columns={
+                "areayacimiento": "Yacimiento",
+                "empresa": "Operador",
+                "cum_oil": "Petróleo YTD (m³)",
+                "cum_gas": "Gas (MMm³)",
+                "wells": "Pozos",
+            })[["#", "Yacimiento", "Operador", "Pozos",
+                "Petróleo YTD (m³)", "BPD YTD", "Gas (MMm³)"]]
+            bench_disp["Petróleo YTD (m³)"] = bench_disp["Petróleo YTD (m³)"].apply(
+                lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+            bench_disp["Gas (MMm³)"] = bench_disp["Gas (MMm³)"].apply(
+                lambda v: f"{v/1000:,.2f}" if pd.notna(v) else "—")
+            bench_disp["BPD YTD"] = bench_disp["BPD YTD"].apply(
+                lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+            bench_disp["Pozos"] = bench_disp["Pozos"].apply(
+                lambda v: f"{int(v):,}" if pd.notna(v) else "—")
+
+            def _highlight_self(row):
+                if row["Yacimiento"] == yacimiento and row["Operador"] == operator:
+                    return ["background-color: #5a3a1a; color: #f4e7c5"] * len(row)
+                return [""] * len(row)
+
+            st.dataframe(
+                bench_disp.style.apply(_highlight_self, axis=1),
+                width="stretch", hide_index=True, height=260,
+            )
+            st.caption(
+                f"Tu yacimiento está resaltado. Peers: top 5 yacimientos de la "
+                f"misma cuenca y tipo de recurso por petróleo YTD {year}."
+            )
 
     # ---------- Export ----------
     st.subheader("Exportar")

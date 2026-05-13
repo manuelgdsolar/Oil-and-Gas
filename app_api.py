@@ -422,6 +422,92 @@ def fetch_resource_paginated(
     return df, total
 
 
+def fetch_resource_via_csv(
+    resource_id: str,
+    progress_cb=None,
+) -> tuple[pd.DataFrame | None, int]:
+    """Fallback: descarga el CSV crudo del recurso cuando `datastore_search`
+    devuelve 404 (típico de años históricos que la Secretaría dejó de
+    indexar pero cuyo archivo CSV sigue disponible para descarga directa).
+
+    Devuelve (DataFrame, total). `total` se setea a `len(df)` porque la
+    descarga directa no expone un contador previo.
+    """
+    t0 = time.perf_counter()
+    # 1) Resolver la URL del CSV vía resource_show
+    try:
+        meta = requests.get(
+            f"{API_BASE}/resource_show",
+            params={"id": resource_id},
+            timeout=HTTP_TIMEOUT, verify=VERIFY_SSL, headers=HTTP_HEADERS,
+        )
+        meta.raise_for_status()
+        result = meta.json().get("result", {}) or {}
+        csv_url = result.get("url", "")
+    except Exception as e:
+        st.session_state["_last_api_error"] = (
+            f"CSV fallback: error resolviendo URL del recurso: {e}"
+        )
+        return None, 0
+
+    if not csv_url or not csv_url.lower().endswith(".csv"):
+        st.session_state["_last_api_error"] = (
+            f"CSV fallback: el recurso no tiene CSV descargable "
+            f"(url='{csv_url[:80]}')."
+        )
+        return None, 0
+
+    # 2) Descargar el CSV con streaming para mostrar progreso
+    if progress_cb:
+        progress_cb(0, None)
+    try:
+        # Timeout generoso — el CSV puede pesar varios MB
+        resp = requests.get(
+            csv_url, timeout=300, verify=VERIFY_SSL,
+            headers=HTTP_HEADERS, stream=True,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        st.session_state["_last_api_error"] = (
+            f"CSV fallback: error descargando CSV: {e}"
+        )
+        return None, 0
+
+    # Leer todo el contenido en memoria (los CSVs son ~10-50 MB)
+    from io import BytesIO
+    buf = BytesIO()
+    total_bytes = 0
+    try:
+        content_length = int(resp.headers.get("content-length", 0))
+    except Exception:
+        content_length = 0
+    for chunk in resp.iter_content(chunk_size=1024 * 256):  # 256 KB
+        if chunk:
+            buf.write(chunk)
+            total_bytes += len(chunk)
+            if progress_cb and content_length > 0:
+                # Mostrar progreso de descarga (filas se reportan después)
+                progress_cb(total_bytes, content_length)
+    buf.seek(0)
+
+    # 3) Parsear con pandas
+    try:
+        df = pd.read_csv(buf, encoding="utf-8-sig", low_memory=False)
+    except UnicodeDecodeError:
+        buf.seek(0)
+        df = pd.read_csv(buf, encoding="latin-1", low_memory=False)
+    except Exception as e:
+        st.session_state["_last_api_error"] = (
+            f"CSV fallback: error parseando CSV: {e}"
+        )
+        return None, 0
+
+    _log_query(f"csv  {resource_id}", time.perf_counter() - t0, len(df), None)
+    if progress_cb:
+        progress_cb(len(df), len(df))
+    return df, len(df)
+
+
 # Columns we expect to coerce to numeric in the production resource
 _NUMERIC_COLS = [
     "anio", "mes", "idpozo", "prod_pet", "prod_gas", "prod_agua",
@@ -463,9 +549,23 @@ def load_year(year: int, force: bool = False, progress_cb=None) -> pd.DataFrame 
         except Exception:
             pass  # corrupt cache — re-download
 
+    # 1) Intentar primero datastore_search (rápido, paginado)
     df, expected_total = fetch_resource_paginated(rid, progress_cb=progress_cb)
+
+    # 2) Si datastore_search falló (típico para años históricos que la
+    # Secretaría dejó de indexar), fallback a descarga del CSV directo.
     if df is None or df.empty:
-        return df
+        _prev_err = st.session_state.get("_last_api_error", "")
+        st.session_state["_last_api_error"] = None
+        df, expected_total = fetch_resource_via_csv(rid, progress_cb=progress_cb)
+        if df is None or df.empty:
+            # Restauramos el error original si tampoco anduvo el CSV
+            if _prev_err:
+                st.session_state["_last_api_error"] = (
+                    f"Datastore: {_prev_err} · CSV fallback también falló: "
+                    f"{st.session_state.get('_last_api_error', 'sin detalle')}"
+                )
+            return df
 
     df = _postprocess_year_df(df)
 
